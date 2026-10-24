@@ -83,7 +83,8 @@ go get github.com/jpedrosouza/asynq@latest
 go mod tidy
 ```
 
-Don't link both libraries into one binary: they register the same protobuf types. If a dependency of yours imports
+Don't link both libraries into one binary: they register the same protobuf types, and the program panics at startup
+(`proto: file "asynq.proto" is already registered`). If a dependency of yours imports
 `github.com/hibiken/asynq` (e.g. asynqmon), move it to this fork too; for the web UI, see
 [Asynqdash](#web-ui). The data in Redis is the same, so servers can be switched one at a time.
 
