@@ -53,9 +53,3 @@ require (
 	gopkg.in/ini.v1 v1.51.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
-
-// Until v0.27.0 of the renamed modules is published
-replace (
-	github.com/jpedrosouza/asynq => ../
-	github.com/jpedrosouza/asynq/x => ../x
-)

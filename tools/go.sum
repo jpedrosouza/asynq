@@ -121,6 +121,10 @@ github.com/hashicorp/serf v0.8.2/go.mod h1:6hOLApaqBFA1NXqRQAsxw9QxuDEvNxSQRwA/J
 github.com/inconshreveable/mousetrap v1.0.0 h1:Z8tu5sraLXCXIcARxBp/8cbvlwVa7Z1NHg9XEKhtSvM=
 github.com/inconshreveable/mousetrap v1.0.0/go.mod h1:PxqpIevigyE2G7u3NXJIT2ANytuPF1OarO4DADm73n8=
 github.com/jonboulle/clockwork v0.1.0/go.mod h1:Ii8DK3G1RaLaWxj9trq07+26W01tbo22gdxWY5EU2bo=
+github.com/jpedrosouza/asynq v0.27.0 h1:FFfRizpmc/qre9mg2fa+somVygodDE1M5lxwXhaiE1w=
+github.com/jpedrosouza/asynq v0.27.0/go.mod h1:be6DHZODIBOm1LxG/EFQBRYu2GClLLWU/yJ0khvpy+o=
+github.com/jpedrosouza/asynq/x v0.27.0 h1:5VA1leH0SWtm5bSwpvS1iy61r00RmoKj8N8iMfcfXqg=
+github.com/jpedrosouza/asynq/x v0.27.0/go.mod h1:Ijoq1+BuzfqnS/SNnCG0HaO2TNsDhbaY3fpIKR+Ir0w=
 github.com/json-iterator/go v1.1.6/go.mod h1:+SdeFBvtyEkXs7REEP0seUULqWtbJapLOCVDaaPEHmU=
 github.com/jstemmer/go-junit-report v0.0.0-20190106144839-af01ea7f8024/go.mod h1:6v2b51hI/fHJwM22ozAgKL4VKDeJcHhJFhtBdhmNjmU=
 github.com/jtolds/gls v4.20.0+incompatible h1:xdiiI2gbIgH/gLH7ADydsJ1uDOEzR8yvV7C0MuV77Wo=

@@ -23,6 +23,3 @@ require (
 	golang.org/x/time v0.14.0 // indirect
 	google.golang.org/protobuf v1.36.10 // indirect
 )
-
-// Until v0.27.0 of the renamed module is published
-replace github.com/jpedrosouza/asynq => ../
