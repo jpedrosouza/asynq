@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.1] - 2026-10-24
+
+### Fixed
+- The library and CLI version (`asynq --version`) reported 0.26.0.
+
 ## [0.27.0] - 2026-10-24
 
 First release of the fork, as `github.com/jpedrosouza/asynq` (see the README for why and how to migrate).
