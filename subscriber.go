@@ -13,6 +13,11 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// cancelationHealthCheckInterval is how long the cancelation channel may stay silent before it is
+// pinged to check the connection. go-redis pings every 3 seconds by default: with one server per
+// queue, that alone was most of the commands an idle application sent to redis.
+const cancelationHealthCheckInterval = time.Minute
+
 type subscriber struct {
 	logger *log.Logger
 	broker base.Broker
@@ -72,7 +77,7 @@ func (s *subscriber) start(wg *sync.WaitGroup) {
 			}
 			break
 		}
-		cancelCh := pubsub.Channel()
+		cancelCh := pubsub.Channel(redis.WithChannelHealthCheckInterval(cancelationHealthCheckInterval))
 		for {
 			select {
 			case <-s.done:

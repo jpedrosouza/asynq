@@ -41,6 +41,10 @@ type processor struct {
 	retryDelayFunc    RetryDelayFunc
 	isFailureFunc     func(error) bool
 
+	// waiter, when set, waits for new tasks while the queues are empty instead of sleeping for
+	// taskCheckInterval (see Config.BlockingDequeue).
+	waiter taskWaiter
+
 	errHandler      ErrorHandler
 	shutdownTimeout time.Duration
 
@@ -78,6 +82,7 @@ type processorParams struct {
 	baseCtxFn         func() context.Context
 	retryDelayFunc    RetryDelayFunc
 	taskCheckInterval time.Duration
+	waiter            taskWaiter
 	isFailureFunc     func(error) bool
 	syncCh            chan<- *syncRequest
 	cancelations      *base.Cancelations
@@ -105,6 +110,7 @@ func newProcessor(params processorParams) *processor {
 		queueConfig:       queues,
 		orderedQueues:     orderedQueues,
 		taskCheckInterval: params.taskCheckInterval,
+		waiter:            params.waiter,
 		retryDelayFunc:    params.retryDelayFunc,
 		isFailureFunc:     params.isFailureFunc,
 		syncRequestCh:     params.syncCh,
@@ -122,6 +128,13 @@ func newProcessor(params processorParams) *processor {
 	}
 }
 
+// taskWaiter blocks until a task may have become pending in one of the queues, or until the timeout.
+// Close ends a wait in progress for good.
+type taskWaiter interface {
+	WaitForTask(ctx context.Context, timeout time.Duration, qnames ...string) error
+	Close() error
+}
+
 // Note: stops only the "processor" goroutine, does not stop workers.
 // It's safe to call this method multiple times.
 func (p *processor) stop() {
@@ -129,6 +142,12 @@ func (p *processor) stop() {
 		p.logger.Debug("Processor shutting down...")
 		// Unblock if processor is waiting for sema token.
 		close(p.quit)
+		// End a wait for tasks, which would otherwise hold the processor for up to taskCheckInterval.
+		if p.waiter != nil {
+			if err := p.waiter.Close(); err != nil {
+				p.logger.Warnf("Failed to close the connection waiting for tasks: %v", err)
+			}
+		}
 		// Signal the processor goroutine to stop processing tasks
 		// from the queue.
 		p.done <- struct{}{}
@@ -147,6 +166,25 @@ func (p *processor) shutdown() {
 		p.sema <- struct{}{}
 	}
 	p.logger.Info("All workers have finished")
+}
+
+// waitForTask blocks until a task may have been enqueued, or for taskCheckInterval at most: every
+// write that makes a task pending signals it (see base.MarkerKey), and the interval still bounds the
+// wait for a task that became pending some other way.
+func (p *processor) waitForTask(qnames []string) {
+	err := p.waiter.WaitForTask(context.Background(), p.taskCheckInterval, qnames...)
+	if err == nil {
+		return
+	}
+	select {
+	case <-p.quit:
+		return // the wait was ended by the shutdown
+	default:
+	}
+	if p.errLogLimiter.Allow() {
+		p.logger.Errorf("Failed to wait for tasks: %v", err)
+	}
+	time.Sleep(time.Second) // e.g. redis is unreachable: do not retry in a tight loop
 }
 
 func (p *processor) start(wg *sync.WaitGroup) {
@@ -178,8 +216,13 @@ func (p *processor) exec() {
 		case errors.Is(err, errors.ErrNoProcessableTask):
 			p.logger.Debug("All queues are empty")
 			// Queues are empty, this is a normal behavior.
+			if p.waiter != nil {
+				p.waitForTask(qnames)
+				<-p.sema // release token
+				return
+			}
 			// Sleep to avoid slamming redis and let scheduler move tasks into queues.
-			// Note: We are not using blocking pop operation and polling queues instead.
+			// Note: Without a waiter we poll the queues instead of using a blocking operation.
 			// This adds significant load to redis.
 			jitter := rand.N(p.taskCheckInterval)
 			time.Sleep(p.taskCheckInterval/2 + jitter)

@@ -116,6 +116,19 @@ type Config struct {
 	// By default, TaskCheckInterval is set to 1 seconds.
 	TaskCheckInterval time.Duration
 
+	// BlockingDequeue makes the server wait for new tasks with a blocking redis command (BZPOPMIN)
+	// while its queues are empty, instead of checking them every TaskCheckInterval: a task is
+	// picked up as soon as it is enqueued, and an idle server sends almost no commands to redis.
+	// Every write that makes a task pending signals the waiting servers; TaskCheckInterval then
+	// bounds each wait, after which the queues are checked anyway (e.g. for a task enqueued by a
+	// client without this signal). Raise it accordingly, e.g. to 10 seconds.
+	//
+	// A server made with NewServer opens one more connection for the wait, and closes it to end the
+	// wait on shutdown; with NewServerFromRedisClient the wait shares the given client, so a
+	// shutdown can take up to TaskCheckInterval longer. Not supported with redis cluster (the
+	// queues of a server live in different hash slots): such a server polls as before.
+	BlockingDequeue bool
+
 	// Function to calculate retry delay for a failed task.
 	//
 	// By default, it uses exponential backoff algorithm to calculate the delay.
@@ -435,8 +448,19 @@ func NewServer(r RedisConnOpt, cfg Config) *Server {
 	}
 	server := NewServerFromRedisClient(redisClient, cfg)
 	server.sharedConnection = false
+	if server.processor.waiter != nil {
+		// A connection of its own for the wait, so that the shutdown can end it by closing it
+		if c, ok := r.MakeRedisClient().(redis.UniversalClient); ok {
+			server.processor.waiter = rdb.NewRDB(c)
+		}
+	}
 	return server
 }
+
+// sharedWaiter waits for tasks on a client the server does not own, so it must not close it.
+type sharedWaiter struct{ *rdb.RDB }
+
+func (sharedWaiter) Close() error { return nil }
 
 // NewServerFromRedisClient returns a new instance of Server given a redis.UniversalClient
 // and server configuration
@@ -541,11 +565,16 @@ func NewServerFromRedisClient(c redis.UniversalClient, cfg Config) *Server {
 		broker:       rdb,
 		cancelations: cancels,
 	})
+	var waiter taskWaiter
+	if _, cluster := c.(*redis.ClusterClient); cfg.BlockingDequeue && !cluster {
+		waiter = sharedWaiter{rdb}
+	}
 	processor := newProcessor(processorParams{
 		logger:            logger,
 		broker:            rdb,
 		retryDelayFunc:    delayFunc,
 		taskCheckInterval: taskCheckInterval,
+		waiter:            waiter,
 		baseCtxFn:         baseCtxFn,
 		isFailureFunc:     isFailureFunc,
 		syncCh:            syncCh,
