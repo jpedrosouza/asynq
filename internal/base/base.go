@@ -122,6 +122,13 @@ func PendingKey(qname string) string {
 	return QueueKeyPrefix(qname) + "pending"
 }
 
+// MarkerKey returns a redis key that signals new pending tasks in the queue to servers that wait
+// for them with a blocking command (see Config.BlockingDequeue). It is a sorted set with a single
+// member: every write that makes a task pending adds it, and a waiting server pops it.
+func MarkerKey(qname string) string {
+	return QueueKeyPrefix(qname) + "marker"
+}
+
 // ActiveKey returns a redis key for the active tasks.
 func ActiveKey(qname string) string {
 	return QueueKeyPrefix(qname) + "active"

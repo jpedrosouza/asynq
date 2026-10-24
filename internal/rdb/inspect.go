@@ -928,6 +928,7 @@ func (r *RDB) RunAllArchivedTasks(qname string) (int64, error) {
 // KEYS[1] -> asynq:{<qname>}:g:<gname>
 // KEYS[2] -> asynq:{<qname>}:pending
 // KEYS[3] -> asynq:{<qname>}:groups
+// KEYS[4] -> asynq:{<qname>}:marker
 // -------
 // ARGV[1] -> task key prefix
 // ARGV[2] -> group name
@@ -942,6 +943,9 @@ for _, id in ipairs(ids) do
 end
 redis.call("DEL", KEYS[1])
 redis.call("SREM", KEYS[3], ARGV[2])
+if table.getn(ids) > 0 then
+	redis.call("ZADD", KEYS[4], 0, "0")
+end
 return table.getn(ids)
 `)
 
@@ -957,6 +961,7 @@ func (r *RDB) RunAllAggregatingTasks(qname, gname string) (int64, error) {
 		base.GroupKey(qname, gname),
 		base.PendingKey(qname),
 		base.AllGroups(qname),
+		base.MarkerKey(qname),
 	}
 	argv := []interface{}{
 		base.TaskKeyPrefix(qname),
@@ -979,6 +984,7 @@ func (r *RDB) RunAllAggregatingTasks(qname, gname string) (int64, error) {
 // KEYS[1] -> asynq:{<qname>}:t:<task_id>
 // KEYS[2] -> asynq:{<qname>}:pending
 // KEYS[3] -> asynq:{<qname>}:groups
+// KEYS[4] -> asynq:{<qname>}:marker
 // --
 // ARGV[1] -> task ID
 // ARGV[2] -> queue key prefix; asynq:{<qname>}:
@@ -1016,6 +1022,7 @@ else
 end
 redis.call("LPUSH", KEYS[2], ARGV[1])
 redis.call("HSET", KEYS[1], "state", "pending")
+redis.call("ZADD", KEYS[4], 0, "0")
 return 1
 `)
 
@@ -1034,6 +1041,7 @@ func (r *RDB) RunTask(qname, id string) error {
 		base.TaskKey(qname, id),
 		base.PendingKey(qname),
 		base.AllGroups(qname),
+		base.MarkerKey(qname),
 	}
 	argv := []interface{}{
 		id,
@@ -1068,6 +1076,7 @@ func (r *RDB) RunTask(qname, id string) error {
 // Input:
 // KEYS[1] -> zset which holds task ids (e.g. asynq:{<qname>}:scheduled)
 // KEYS[2] -> asynq:{<qname>}:pending
+// KEYS[3] -> asynq:{<qname>}:marker
 // --
 // ARGV[1] -> task key prefix
 //
@@ -1080,6 +1089,9 @@ for _, id in ipairs(ids) do
 	redis.call("HSET", ARGV[1] .. id, "state", "pending")
 end
 redis.call("DEL", KEYS[1])
+if table.getn(ids) > 0 then
+	redis.call("ZADD", KEYS[3], 0, "0")
+end
 return table.getn(ids)`)
 
 func (r *RDB) runAll(zset, qname string) (int64, error) {
@@ -1089,6 +1101,7 @@ func (r *RDB) runAll(zset, qname string) (int64, error) {
 	keys := []string{
 		zset,
 		base.PendingKey(qname),
+		base.MarkerKey(qname),
 	}
 	argv := []interface{}{
 		base.TaskKeyPrefix(qname),
@@ -1919,6 +1932,9 @@ func (r *RDB) RemoveQueue(qname string, force bool) error {
 		if err := r.client.SRem(context.Background(), base.AllQueues, qname).Err(); err != nil {
 			return errors.E(op, errors.Unknown, err)
 		}
+		if err := r.client.Del(context.Background(), base.MarkerKey(qname)).Err(); err != nil {
+			return errors.E(op, errors.Unknown, err)
+		}
 		r.queuesPublished.Delete(qname)
 		return nil
 	case -1:
@@ -2079,7 +2095,8 @@ func (r *RDB) Unpause(qname string) error {
 	if deleted == 0 {
 		return fmt.Errorf("queue %q is not paused", qname)
 	}
-	return nil
+	// Servers waiting for tasks skipped the pending ones while the queue was paused
+	return r.client.ZAdd(context.Background(), base.MarkerKey(qname), redis.Z{Score: 0, Member: "0"}).Err()
 }
 
 // ClusterKeySlot returns an integer identifying the hash slot the given queue hashes to.

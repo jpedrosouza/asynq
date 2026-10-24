@@ -87,6 +87,7 @@ func (r *RDB) runScriptWithErrorCode(ctx context.Context, op errors.Op, script *
 // Input:
 // KEYS[1] -> asynq:{<qname>}:t:<task_id>
 // KEYS[2] -> asynq:{<qname>}:pending
+// KEYS[3] -> asynq:{<qname>}:marker
 // --
 // ARGV[1] -> task message data
 // ARGV[2] -> task ID
@@ -104,6 +105,7 @@ redis.call("HSET", KEYS[1],
            "state", "pending",
            "pending_since", ARGV[3])
 redis.call("LPUSH", KEYS[2], ARGV[2])
+redis.call("ZADD", KEYS[3], 0, "0")
 return 1
 `)
 
@@ -123,6 +125,7 @@ func (r *RDB) Enqueue(ctx context.Context, msg *base.TaskMessage) error {
 	keys := []string{
 		base.TaskKey(msg.Queue, msg.ID),
 		base.PendingKey(msg.Queue),
+		base.MarkerKey(msg.Queue),
 	}
 	argv := []interface{}{
 		encoded,
@@ -144,6 +147,7 @@ func (r *RDB) Enqueue(ctx context.Context, msg *base.TaskMessage) error {
 // KEYS[1] -> unique key
 // KEYS[2] -> asynq:{<qname>}:t:<taskid>
 // KEYS[3] -> asynq:{<qname>}:pending
+// KEYS[4] -> asynq:{<qname>}:marker
 // --
 // ARGV[1] -> task ID
 // ARGV[2] -> uniqueness lock TTL
@@ -168,6 +172,7 @@ redis.call("HSET", KEYS[2],
            "pending_since", ARGV[4],
            "unique_key", KEYS[1])
 redis.call("LPUSH", KEYS[3], ARGV[1])
+redis.call("ZADD", KEYS[4], 0, "0")
 return 1
 `)
 
@@ -189,6 +194,7 @@ func (r *RDB) EnqueueUnique(ctx context.Context, msg *base.TaskMessage, ttl time
 		msg.UniqueKey,
 		base.TaskKey(msg.Queue, msg.ID),
 		base.PendingKey(msg.Queue),
+		base.MarkerKey(msg.Queue),
 	}
 	argv := []interface{}{
 		msg.ID,
@@ -214,6 +220,7 @@ func (r *RDB) EnqueueUnique(ctx context.Context, msg *base.TaskMessage, ttl time
 // KEYS[2] -> asynq:{<qname>}:paused
 // KEYS[3] -> asynq:{<qname>}:active
 // KEYS[4] -> asynq:{<qname>}:lease
+// KEYS[5] -> asynq:{<qname>}:marker
 // --
 // ARGV[1] -> initial lease expiration Unix time
 // ARGV[2] -> task key prefix
@@ -223,7 +230,9 @@ func (r *RDB) EnqueueUnique(ctx context.Context, msg *base.TaskMessage, ttl time
 // Returns an encoded TaskMessage.
 //
 // Note: dequeueCmd checks whether a queue is paused first, before
-// calling RPOPLPUSH to pop a task from the queue.
+// calling RPOPLPUSH to pop a task from the queue. When tasks are left
+// pending, it sets the marker again: a blocking wait wakes a single
+// server, and the others must learn about the rest too.
 var dequeueCmd = redis.NewScript(`
 if redis.call("EXISTS", KEYS[2]) == 0 then
 	local id = redis.call("RPOPLPUSH", KEYS[1], KEYS[3])
@@ -232,6 +241,9 @@ if redis.call("EXISTS", KEYS[2]) == 0 then
 		redis.call("HSET", key, "state", "active")
 		redis.call("HDEL", key, "pending_since")
 		redis.call("ZADD", KEYS[4], ARGV[1], id)
+		if redis.call("LLEN", KEYS[1]) > 0 then
+			redis.call("ZADD", KEYS[5], 0, "0")
+		end
 		return redis.call("HGET", key, "msg")
 	end
 end
@@ -249,6 +261,7 @@ func (r *RDB) Dequeue(qnames ...string) (msg *base.TaskMessage, leaseExpirationT
 			base.PausedKey(qname),
 			base.ActiveKey(qname),
 			base.LeaseKey(qname),
+			base.MarkerKey(qname),
 		}
 		leaseExpirationTime = r.clock.Now().Add(LeaseDuration)
 		argv := []interface{}{
@@ -271,6 +284,24 @@ func (r *RDB) Dequeue(qnames ...string) (msg *base.TaskMessage, leaseExpirationT
 		return msg, leaseExpirationTime, nil
 	}
 	return nil, time.Time{}, errors.E(op, errors.NotFound, errors.ErrNoProcessableTask)
+}
+
+// WaitForTask blocks until a task may have become pending in one of the queues, or until the
+// timeout. It pops the marker of the queues (see base.MarkerKey), so a nil error tells neither
+// which queue it was nor that the task is still there: the caller dequeues to find out.
+//
+// The call holds a connection for up to the timeout; use a client of its own, which can also be
+// closed to end the wait early.
+func (r *RDB) WaitForTask(ctx context.Context, timeout time.Duration, qnames ...string) error {
+	var op errors.Op = "rdb.WaitForTask"
+	keys := make([]string, len(qnames))
+	for i, qname := range qnames {
+		keys[i] = base.MarkerKey(qname)
+	}
+	if err := r.client.BZPopMin(ctx, timeout, keys...).Err(); err != nil && err != redis.Nil {
+		return errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "bzpopmin", Err: err})
+	}
+	return nil
 }
 
 // KEYS[1] -> asynq:{<qname>}:active
@@ -481,6 +512,7 @@ func (r *RDB) MarkAsComplete(ctx context.Context, msg *base.TaskMessage) error {
 // KEYS[2] -> asynq:{<qname>}:lease
 // KEYS[3] -> asynq:{<qname>}:pending
 // KEYS[4] -> asynq:{<qname>}:t:<task_id>
+// KEYS[5] -> asynq:{<qname>}:marker
 // ARGV[1] -> task ID
 // Note: Use RPUSH to push to the head of the queue.
 var requeueCmd = redis.NewScript(`
@@ -492,6 +524,7 @@ if redis.call("ZREM", KEYS[2], ARGV[1]) == 0 then
 end
 redis.call("RPUSH", KEYS[3], ARGV[1])
 redis.call("HSET", KEYS[4], "state", "pending")
+redis.call("ZADD", KEYS[5], 0, "0")
 return redis.status_reply("OK")`)
 
 // Requeue moves the task from active queue to the specified queue.
@@ -502,6 +535,7 @@ func (r *RDB) Requeue(ctx context.Context, msg *base.TaskMessage) error {
 		base.LeaseKey(msg.Queue),
 		base.PendingKey(msg.Queue),
 		base.TaskKey(msg.Queue, msg.ID),
+		base.MarkerKey(msg.Queue),
 	}
 	return r.runScript(ctx, op, requeueCmd, keys, msg.ID)
 }
@@ -952,6 +986,7 @@ func (r *RDB) ForwardIfReady(qnames ...string) error {
 
 // KEYS[1] -> source queue (e.g. asynq:{<qname>:scheduled or asynq:{<qname>}:retry})
 // KEYS[2] -> asynq:{<qname>}:pending
+// KEYS[3] -> asynq:{<qname>}:marker
 // ARGV[1] -> current unix time in seconds
 // ARGV[2] -> task key prefix
 // ARGV[3] -> current unix time in nsec
@@ -959,6 +994,7 @@ func (r *RDB) ForwardIfReady(qnames ...string) error {
 // Note: Script moves tasks up to 100 at a time to keep the runtime of script short.
 var forwardCmd = redis.NewScript(`
 local ids = redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", ARGV[1], "LIMIT", 0, 100)
+local pending = false
 for _, id in ipairs(ids) do
 	local taskKey = ARGV[2] .. id
 	local group = redis.call("HGET", taskKey, "group")
@@ -973,16 +1009,20 @@ for _, id in ipairs(ids) do
 		redis.call("HSET", taskKey,
 				   "state", "pending",
 				   "pending_since", ARGV[3])
+		pending = true
 	end
+end
+if pending then
+	redis.call("ZADD", KEYS[3], 0, "0")
 end
 return table.getn(ids)`)
 
 // forward moves tasks with a score less than the current unix time from the delayed (i.e. scheduled | retry) zset
 // to the pending list or group set.
 // It returns the number of tasks moved.
-func (r *RDB) forward(delayedKey, pendingKey, taskKeyPrefix, groupKeyPrefix string) (int, error) {
+func (r *RDB) forward(delayedKey, pendingKey, markerKey, taskKeyPrefix, groupKeyPrefix string) (int, error) {
 	now := r.clock.Now()
-	keys := []string{delayedKey, pendingKey}
+	keys := []string{delayedKey, pendingKey, markerKey}
 	argv := []interface{}{
 		now.Unix(),
 		taskKeyPrefix,
@@ -1005,12 +1045,13 @@ func (r *RDB) forward(delayedKey, pendingKey, taskKeyPrefix, groupKeyPrefix stri
 func (r *RDB) forwardAll(qname string) (err error) {
 	delayedKeys := []string{base.ScheduledKey(qname), base.RetryKey(qname)}
 	pendingKey := base.PendingKey(qname)
+	markerKey := base.MarkerKey(qname)
 	taskKeyPrefix := base.TaskKeyPrefix(qname)
 	groupKeyPrefix := base.GroupKeyPrefix(qname)
 	for _, delayedKey := range delayedKeys {
 		n := 1
 		for n != 0 {
-			n, err = r.forward(delayedKey, pendingKey, taskKeyPrefix, groupKeyPrefix)
+			n, err = r.forward(delayedKey, pendingKey, markerKey, taskKeyPrefix, groupKeyPrefix)
 			if err != nil {
 				return err
 			}
