@@ -14,10 +14,10 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"github.com/hibiken/asynq/internal/base"
-	"github.com/hibiken/asynq/internal/rdb"
-	"github.com/hibiken/asynq/internal/testbroker"
-	h "github.com/hibiken/asynq/internal/testutil"
+	"github.com/jpedrosouza/asynq/internal/base"
+	"github.com/jpedrosouza/asynq/internal/rdb"
+	"github.com/jpedrosouza/asynq/internal/testbroker"
+	h "github.com/jpedrosouza/asynq/internal/testutil"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -1969,7 +1969,7 @@ func (h evalErrorHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis
 	return next
 }
 
-// Regression test for https://github.com/hibiken/asynq/issues/1166
+// Regression test for https://github.com/jpedrosouza/asynq/issues/1166
 func TestClientEnqueuePreservesRedisError(t *testing.T) {
 	tests := []struct {
 		desc string

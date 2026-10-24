@@ -14,9 +14,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hibiken/asynq/internal/errors"
-	pb "github.com/hibiken/asynq/internal/proto"
-	"github.com/hibiken/asynq/internal/timeutil"
+	"github.com/jpedrosouza/asynq/internal/errors"
+	pb "github.com/jpedrosouza/asynq/internal/proto"
+	"github.com/jpedrosouza/asynq/internal/timeutil"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"

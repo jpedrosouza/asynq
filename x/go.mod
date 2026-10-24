@@ -1,12 +1,12 @@
-module github.com/hibiken/asynq/x
+module github.com/jpedrosouza/asynq/x
 
-go 1.22
+go 1.24.0
 
 require (
 	github.com/google/uuid v1.6.0
-	github.com/hibiken/asynq v0.25.0
+	github.com/jpedrosouza/asynq v0.27.0
 	github.com/prometheus/client_golang v1.20.5
-	github.com/redis/go-redis/v9 v9.7.0
+	github.com/redis/go-redis/v9 v9.14.1
 )
 
 require (
@@ -18,8 +18,11 @@ require (
 	github.com/prometheus/common v0.55.0 // indirect
 	github.com/prometheus/procfs v0.15.1 // indirect
 	github.com/robfig/cron/v3 v3.0.1 // indirect
-	github.com/spf13/cast v1.7.0 // indirect
-	golang.org/x/sys v0.26.0 // indirect
-	golang.org/x/time v0.7.0 // indirect
-	google.golang.org/protobuf v1.35.1 // indirect
+	github.com/spf13/cast v1.10.0 // indirect
+	golang.org/x/sys v0.37.0 // indirect
+	golang.org/x/time v0.14.0 // indirect
+	google.golang.org/protobuf v1.36.10 // indirect
 )
+
+// Until v0.27.0 of the renamed module is published
+replace github.com/jpedrosouza/asynq => ../

@@ -14,7 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/gdamore/tcell/v2"
-	"github.com/hibiken/asynq"
+	"github.com/jpedrosouza/asynq"
 	"github.com/mattn/go-runewidth"
 )
 

@@ -1,4 +1,4 @@
-module github.com/hibiken/asynq
+module github.com/jpedrosouza/asynq
 
 go 1.24.0
 

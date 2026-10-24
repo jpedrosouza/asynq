@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hibiken/asynq/internal/testutil"
+	"github.com/jpedrosouza/asynq/internal/testutil"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/goleak"
 )

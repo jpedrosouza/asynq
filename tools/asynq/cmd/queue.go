@@ -10,8 +10,8 @@ import (
 
 	"github.com/MakeNowJust/heredoc/v2"
 	"github.com/fatih/color"
-	"github.com/hibiken/asynq"
-	"github.com/hibiken/asynq/internal/errors"
+	"github.com/jpedrosouza/asynq"
+	"github.com/jpedrosouza/asynq/internal/errors"
 	"github.com/spf13/cobra"
 )
 
@@ -49,8 +49,8 @@ var queueListCmd = &cobra.Command{
 var queueInspectCmd = &cobra.Command{
 	Use:   "inspect <queue> [<queue>...]",
 	Short: "Display detailed information on one or more queues",
-	Args: cobra.MinimumNArgs(1),
-	RunE: queueInspect,
+	Args:  cobra.MinimumNArgs(1),
+	RunE:  queueInspect,
 	Example: heredoc.Doc(`
 		$ asynq queue inspect myqueue
 		$ asynq queue inspect queue1 queue2 queue3`),
@@ -59,8 +59,8 @@ var queueInspectCmd = &cobra.Command{
 var queueHistoryCmd = &cobra.Command{
 	Use:   "history <queue> [<queue>...]",
 	Short: "Display historical aggregate data from one or more queues",
-	Args: cobra.MinimumNArgs(1),
-	RunE: queueHistory,
+	Args:  cobra.MinimumNArgs(1),
+	RunE:  queueHistory,
 	Example: heredoc.Doc(`
 		$ asynq queue history myqueue
 		$ asynq queue history queue1 queue2 queue3

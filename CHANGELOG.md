@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-10-24
+
+First release of the fork, as `github.com/jpedrosouza/asynq` (see the README for why and how to migrate).
+
+### Added
+- `Config.BlockingDequeue`: an idle server waits for new tasks with `BZPOPMIN` on a marker of its queues, set by every
+  write that makes a task pending, instead of polling the queues every `TaskCheckInterval`. A new task is picked up in
+  milliseconds, and idle queues send almost no commands to Redis.
+
+### Changed
+- The module path is `github.com/jpedrosouza/asynq` (with `/x` and `/tools`).
+- The cancelation pub/sub channel is health-checked every minute instead of every 3 seconds.
+
+### Included from hibiken/asynq master (unreleased there)
+- Add `Client.BatchEnqueueContext` for pipelined multi-task enqueue (PR: https://github.com/hibiken/asynq/pull/1094)
+- Add options to set task headers, and `Task.Options()` (PR: https://github.com/hibiken/asynq/pull/1096)
+- Fix: preserve underlying Redis errors instead of stringifying them (PR: https://github.com/hibiken/asynq/pull/1179)
+- Fix: close the pubsub connection on Subscribe error in CancelationPubSub (PR: https://github.com/hibiken/asynq/pull/1104)
+- Fix: parse the DB number from the redis-sentinel URI path (PR: https://github.com/hibiken/asynq/pull/1100)
+- Fix: nil panic in the memoryUsageCmd Lua script (PR: https://github.com/hibiken/asynq/pull/1092)
+- Allow disabling memory usage profiling (PR: https://github.com/hibiken/asynq/pull/1127)
+- CLI commands return their errors (PR: https://github.com/hibiken/asynq/pull/1101)
+
 ## [0.26.0] - 2026-02-03
 
 ### Upgrades

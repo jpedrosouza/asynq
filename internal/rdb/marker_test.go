@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hibiken/asynq/internal/base"
-	h "github.com/hibiken/asynq/internal/testutil"
+	"github.com/jpedrosouza/asynq/internal/base"
+	h "github.com/jpedrosouza/asynq/internal/testutil"
 	"github.com/redis/go-redis/v9"
 )
 
