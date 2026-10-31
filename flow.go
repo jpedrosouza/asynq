@@ -208,10 +208,29 @@ func (o flowOption) Type() OptionType   { return flowOpt }
 func (o flowOption) Value() interface{} { return [3]string{o.flow, o.run, o.parent} }
 
 // flowContext is attached to the context passed to handlers, for EnqueueChild.
+//
+// The handler may still run while the processor ends the task (e.g. after a timeout), so EnqueueChild does not touch
+// the task message: it reads a copy of it, and records the run it starts in runID, which the processor copies into
+// the message from its own goroutine (see apply).
 type flowContext struct {
-	mu     sync.Mutex
 	runner *flowRunner
-	msg    *base.TaskMessage
+	task   base.TaskMessage // copy of the task message, read only
+
+	mu    sync.Mutex
+	runID string // run started by EnqueueChild, guarded by mu
+}
+
+func newFlowContext(runner *flowRunner, msg *base.TaskMessage) *flowContext {
+	return &flowContext{runner: runner, task: *msg}
+}
+
+// apply records in the task message the flow run started by EnqueueChild, if any.
+func (fc *flowContext) apply(msg *base.TaskMessage) {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if fc.runID != "" {
+		msg.FlowRun = fc.runID
+	}
 }
 
 type flowContextKey struct{}
@@ -513,13 +532,16 @@ func EnqueueChild(ctx context.Context, task *Task, opts ...Option) (*TaskInfo, e
 	}
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
-	fr, msg := fc.runner, fc.msg
+	fr, msg := fc.runner, &fc.task
 	all := append([]Option{Queue(msg.Queue), TaskID(uuid.NewString())}, task.opts...)
 	c, err := fr.prepare(task, append(all, opts...))
 	if err != nil {
 		return nil, err
 	}
 	runID := msg.FlowRun
+	if fc.runID != "" {
+		runID = fc.runID
+	}
 	var meta *base.FlowRunMeta
 	if runID == "" {
 		runID = msg.ID
@@ -535,8 +557,8 @@ func EnqueueChild(ctx context.Context, task *Task, opts ...Option) (*TaskInfo, e
 	if err := fr.broker.UpdateFlowRun(ctx, runID, meta, nodes); err != nil {
 		return nil, fmt.Errorf("asynq: cannot record flow run %s: %w", runID, err)
 	}
-	// The task is part of the run from now on, so its completion is recorded too.
-	msg.FlowRun = runID
+	// The task is part of the run from now on, so its completion is recorded too (see flowContext.apply).
+	fc.runID = runID
 	return fr.client.EnqueueContext(ctx, c.task, append(c.opts, flowOption{flow: msg.Flow, run: runID, parent: msg.ID})...)
 }
 

@@ -10,7 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jpedrosouza/asynq/internal/base"
 	"github.com/jpedrosouza/asynq/internal/rdb"
+	h "github.com/jpedrosouza/asynq/internal/testutil"
 )
 
 func TestProcessorRecordsTaskTiming(t *testing.T) {
@@ -285,5 +287,47 @@ func TestRateLimitOptionParsing(t *testing.T) {
 	}
 	if err := NewInspector(RedisClientOpt{Addr: "localhost:0"}).SetQueueRateLimit("q", RateLimit{Limit: 0, Period: time.Second}); err == nil {
 		t.Errorf("rate limit with zero limit accepted")
+	}
+}
+
+// A task recovered after its lease expired was not measured: its stored timing, from an earlier attempt, must not be
+// recorded in the task metrics.
+func TestRecoveredTaskRecordsNoMetrics(t *testing.T) {
+	r := setup(t)
+	defer r.Close()
+	rdbClient := rdb.NewRDB(r)
+	inspector := NewInspector(getRedisConnOpt(t))
+	defer inspector.Close()
+
+	msg := h.NewTaskMessage("lost", nil)
+	msg.Retry = 3
+	msg.StartedAt = time.Now().Add(-time.Hour).UnixMilli() // an earlier attempt
+	msg.DurationMs = 1234
+	h.SeedActiveQueue(t, r, []*base.TaskMessage{msg}, "default")
+	h.SeedLease(t, r, []base.Z{{Message: msg, Score: time.Now().Add(-time.Minute).Unix()}}, "default")
+
+	rec := newRecoverer(recovererParams{
+		logger:         testLogger,
+		broker:         rdbClient,
+		queues:         []string{"default"},
+		interval:       time.Second,
+		retryDelayFunc: DefaultRetryDelayFunc,
+		isFailureFunc:  defaultIsFailureFunc,
+	})
+	rec.recoverLeaseExpiredTasks()
+
+	info, err := inspector.GetTaskInfo("default", msg.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.State != TaskStateRetry {
+		t.Fatalf("recovered task state = %v, want retry", info.State)
+	}
+	points, err := inspector.TaskMetrics("default", time.Minute, time.Now().Add(-time.Minute), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 0 {
+		t.Errorf("metrics recorded for a recovered task: %+v", points[0].Types)
 	}
 }

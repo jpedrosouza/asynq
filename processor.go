@@ -287,7 +287,8 @@ func (p *processor) exec() {
 			setDuration := func() { msg.DurationMs = max(p.clock.Now().Sub(start).Milliseconds(), 0) }
 
 			ctx, cancel := asynqcontext.New(p.baseCtxFn(), msg, deadline)
-			ctx = context.WithValue(ctx, flowContextKey{}, &flowContext{runner: p.flows, msg: msg})
+			fc := newFlowContext(p.flows, msg)
+			ctx = context.WithValue(ctx, flowContextKey{}, fc)
 			p.cancelations.Add(msg.ID, cancel)
 			defer func() {
 				cancel()
@@ -327,14 +328,17 @@ func (p *processor) exec() {
 			case <-lease.Done():
 				cancel()
 				setDuration()
+				fc.apply(msg)
 				p.handleFailedMessage(ctx, lease, msg, ErrLeaseExpired)
 				return
 			case <-ctx.Done():
 				setDuration()
+				fc.apply(msg)
 				p.handleFailedMessage(ctx, lease, msg, ctx.Err())
 				return
 			case resErr := <-resCh:
 				setDuration()
+				fc.apply(msg)
 				if resErr != nil {
 					p.handleFailedMessage(ctx, lease, msg, resErr)
 					return

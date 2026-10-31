@@ -95,6 +95,9 @@ func (r *recoverer) recoverLeaseExpiredTasks() {
 		return
 	}
 	for _, msg := range msgs {
+		// The stored timing is the one of an earlier attempt, if any: the attempt that lost its lease was not measured,
+		// so it must not be recorded in the task metrics.
+		msg.StartedAt, msg.DurationMs, msg.WaitMs = 0, 0, 0
 		if msg.Retried >= msg.Retry {
 			r.archive(msg, ErrLeaseExpired)
 		} else {

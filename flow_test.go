@@ -319,3 +319,37 @@ func TestFlowDefinitionsArePublished(t *testing.T) {
 	}()
 	newFlowRegistry([]*Flow{NewFlow("x"), NewFlow("x")})
 }
+
+// A handler that outlives its timeout and then calls EnqueueChild must not race with the processor ending the task.
+func TestEnqueueChildAfterTimeout(t *testing.T) {
+	r := setup(t)
+	defer r.Close()
+	rdbClient := rdb.NewRDB(r)
+	client := NewClient(getRedisConnOpt(t))
+	defer client.Close()
+
+	done := make(chan struct{})
+	handler := HandlerFunc(func(ctx context.Context, task *Task) error {
+		if task.Type() != "slow" {
+			return nil
+		}
+		defer close(done)
+		<-ctx.Done() // the task times out
+		time.Sleep(50 * time.Millisecond)
+		_, err := EnqueueChild(ctx, NewTask("child", nil))
+		return err
+	})
+	if _, err := client.Enqueue(NewTask("slow", nil), Timeout(time.Second), MaxRetry(0)); err != nil {
+		t.Fatal(err)
+	}
+	p := newProcessorForTest(t, rdbClient, handler)
+	p.flows = newFlowRunner(testLogger, rdbClient, nil)
+	p.start(&sync.WaitGroup{})
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not return")
+	}
+	time.Sleep(200 * time.Millisecond)
+	p.shutdown()
+}
