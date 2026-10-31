@@ -6,6 +6,7 @@ package asynq
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"time"
 
@@ -34,6 +35,13 @@ type aggregator struct {
 	// User provided group aggregator.
 	ga GroupAggregator
 
+	// policyFn returns the aggregation policy of a group, nil to use the configuration above for every group.
+	policyFn func(queue, group string) GroupPolicy
+
+	// published holds the policies last published for each queue, and when they were published.
+	published   map[string]map[string]base.GroupPolicy
+	publishedAt map[string]time.Time
+
 	// interval used to check for aggregation
 	interval time.Duration
 
@@ -50,6 +58,7 @@ type aggregatorParams struct {
 	maxDelay        time.Duration
 	maxSize         int
 	groupAggregator GroupAggregator
+	groupPolicy     func(queue, group string) GroupPolicy
 }
 
 const (
@@ -76,6 +85,9 @@ func newAggregator(params aggregatorParams) *aggregator {
 		maxDelay:    params.maxDelay,
 		maxSize:     params.maxSize,
 		ga:          params.groupAggregator,
+		policyFn:    params.groupPolicy,
+		published:   make(map[string]map[string]base.GroupPolicy),
+		publishedAt: make(map[string]time.Time),
 		sema:        make(chan struct{}, maxConcurrentAggregationChecks),
 		interval:    interval,
 	}
@@ -135,9 +147,11 @@ func (a *aggregator) aggregate(t time.Time) {
 			a.logger.Errorf("Failed to list groups in queue: %q", qname)
 			continue
 		}
+		policies := make(map[string]base.GroupPolicy, len(groups))
 		for _, gname := range groups {
-			aggregationSetID, err := a.broker.AggregationCheck(
-				qname, gname, t, a.gracePeriod, a.maxDelay, a.maxSize)
+			policy := a.policy(qname, gname)
+			policies[gname] = policy
+			aggregationSetID, err := a.broker.AggregationCheckPolicy(qname, gname, t, policy)
 			if err != nil {
 				a.logger.Errorf("Failed to run aggregation check: queue=%q group=%q", qname, gname)
 				continue
@@ -154,9 +168,14 @@ func (a *aggregator) aggregate(t time.Time) {
 					qname, gname, aggregationSetID)
 				continue
 			}
+			// The group is ordered by second; order the tasks added within the same second by enqueue time.
+			sort.SliceStable(msgs, func(i, j int) bool {
+				return msgs[i].EnqueuedAt != 0 && msgs[j].EnqueuedAt != 0 && msgs[i].EnqueuedAt < msgs[j].EnqueuedAt
+			})
 			tasks := make([]*Task, len(msgs))
 			for i, m := range msgs {
 				tasks[i] = NewTaskWithHeaders(m.Type, m.Payload, m.Headers)
+				tasks[i].member = m
 			}
 			aggregatedTask := a.ga.Aggregate(gname, tasks)
 			ctx, cancel := context.WithDeadline(context.Background(), deadline)
@@ -172,5 +191,43 @@ func (a *aggregator) aggregate(t time.Time) {
 			}
 			cancel()
 		}
+		a.publishPolicies(qname, policies, t)
 	}
+}
+
+// policy returns the aggregation policy of the group.
+func (a *aggregator) policy(qname, gname string) base.GroupPolicy {
+	var p GroupPolicy
+	if a.policyFn != nil {
+		p = a.policyFn(qname, gname)
+	}
+	return p.resolve(a.maxSize, a.gracePeriod, a.maxDelay)
+}
+
+// policiesRefreshInterval is how often the group policies are published even when they did not change.
+const policiesRefreshInterval = 10 * time.Minute
+
+// publishPolicies records the policies of the groups of the queue in redis when they changed, so that tools can
+// show how far a group is from being aggregated.
+func (a *aggregator) publishPolicies(qname string, policies map[string]base.GroupPolicy, t time.Time) {
+	if len(policies) == 0 {
+		return
+	}
+	prev := a.published[qname]
+	changed := t.Sub(a.publishedAt[qname]) >= policiesRefreshInterval
+	for gname, p := range policies {
+		if old, ok := prev[gname]; !ok || old != p {
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		return
+	}
+	if err := a.broker.PublishGroupPolicies(qname, policies); err != nil {
+		a.logger.Warnf("Failed to publish group policies: queue=%q: %v", qname, err)
+		return
+	}
+	a.published[qname] = policies
+	a.publishedAt[qname] = t
 }

@@ -82,6 +82,33 @@ func (tb *TestBroker) Dequeue(qnames ...string) (*base.TaskMessage, time.Time, e
 	return tb.real.Dequeue(qnames...)
 }
 
+func (tb *TestBroker) DequeueTask(qnames ...string) (*base.DequeuedTask, error) {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.sleeping {
+		return nil, errRedisDown
+	}
+	return tb.real.DequeueTask(qnames...)
+}
+
+func (tb *TestBroker) Defer(ctx context.Context, msg *base.TaskMessage, processAt time.Time) error {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.sleeping {
+		return errRedisDown
+	}
+	return tb.real.Defer(ctx, msg, processAt)
+}
+
+func (tb *TestBroker) ReserveRateLimit(ctx context.Context, key string) (time.Time, error) {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.sleeping {
+		return time.Time{}, errRedisDown
+	}
+	return tb.real.ReserveRateLimit(ctx, key)
+}
+
 func (tb *TestBroker) Done(ctx context.Context, msg *base.TaskMessage) error {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
@@ -271,6 +298,33 @@ func (tb *TestBroker) ListGroups(qname string) ([]string, error) {
 	return tb.real.ListGroups(qname)
 }
 
+func (tb *TestBroker) AggregationCheckPolicy(qname, gname string, t time.Time, policy base.GroupPolicy) (string, error) {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.sleeping {
+		return "", errRedisDown
+	}
+	return tb.real.AggregationCheckPolicy(qname, gname, t, policy)
+}
+
+func (tb *TestBroker) PublishGroupPolicies(qname string, policies map[string]base.GroupPolicy) error {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.sleeping {
+		return errRedisDown
+	}
+	return tb.real.PublishGroupPolicies(qname, policies)
+}
+
+func (tb *TestBroker) AddToArchive(ctx context.Context, msg *base.TaskMessage) error {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.sleeping {
+		return errRedisDown
+	}
+	return tb.real.AddToArchive(ctx, msg)
+}
+
 func (tb *TestBroker) AggregationCheck(qname, gname string, t time.Time, gracePeriod, maxDelay time.Duration, maxSize int) (aggregationSetID string, err error) {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
@@ -305,4 +359,31 @@ func (tb *TestBroker) ReclaimStaleAggregationSets(qname string) error {
 		return errRedisDown
 	}
 	return tb.real.ReclaimStaleAggregationSets(qname)
+}
+
+func (tb *TestBroker) UpdateFlowRun(ctx context.Context, runID string, meta *base.FlowRunMeta, nodes []*base.FlowNode) error {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.sleeping {
+		return errRedisDown
+	}
+	return tb.real.UpdateFlowRun(ctx, runID, meta, nodes)
+}
+
+func (tb *TestBroker) GetFlowRun(runID string) (*base.FlowRun, error) {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.sleeping {
+		return nil, errRedisDown
+	}
+	return tb.real.GetFlowRun(runID)
+}
+
+func (tb *TestBroker) PublishFlows(defs []*base.FlowDefinition) error {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.sleeping {
+		return errRedisDown
+	}
+	return tb.real.PublishFlows(defs)
 }

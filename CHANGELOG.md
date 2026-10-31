@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-10-31
+
+### Added
+- Task timing: tasks record when they were enqueued (`TaskInfo.EnqueuedAt`), and when their last processing attempt
+  started, how long it took and how long the task waited in the pending state before it (`StartedAt`, `Duration`,
+  `WaitTime`).
+- Task metrics: servers record, per queue and task type, the processed and failed tasks with histograms of their
+  processing duration and wait time, per minute (kept 48 hours) and per hour (kept 90 days), in the same Redis call that
+  ends a task. Read them with `Inspector.TaskMetrics` (average, percentiles, max); disable with `Config.DisableTaskMetrics`.
+- Rate limits, stored in Redis and shared by all servers (GCRA, with optional burst):
+  - per queue (`Inspector.SetQueueRateLimit`): tasks stay pending until the queue's limit allows them;
+  - per key (`Inspector.SetRateLimit` and the `RateLimitKey` task option), shared across queues: a task over the limit
+    reserves the next free slot and waits for it, moved back to the scheduled state when the slot is more than 2s away.
+  Waiting for a rate limit never counts as a retry.
+- Batches: `NewBatchTask` wraps the tasks of a group into one task that keeps their identity, `ServeMux.HandleBatch`
+  processes it, and `Batch.Retry` / `Batch.Fail` put single items back in the group or archive them.
+- Per-group aggregation criteria (`Config.GroupPolicy`, with `GroupPolicy.MinSize` and disabled criteria), groups
+  flushed on demand (`Inspector.FlushGroup`), and `GroupInfo` reports the age of the group and its policy.
+- Flows (`Config.Flows`, `NewFlow`, `Flow.Then`, `Flow.Join`): when a task completes, the server enqueues the next tasks
+  of its flow, built from its result, fanning out and joining. `EnqueueChild` chains tasks by hand from a handler. Runs
+  are recorded for 7 days (`Inspector.FlowRuns`, `Inspector.GetFlowRun`) and servers publish the flow definitions
+  (`Inspector.Flows`).
+- Queue metadata (`Inspector.SetQueueMetadata`): a category, subcategory and description to organize queues, also in
+  `QueueInfo.Metadata`.
+
+### Changed
+- The members of a group are passed to the `GroupAggregator` in the order they were enqueued, to the millisecond.
+
 ## [0.27.1] - 2026-10-24
 
 ### Fixed

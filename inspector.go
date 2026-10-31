@@ -68,8 +68,12 @@ func (i *Inspector) Groups(queue string) ([]*GroupInfo, error) {
 	var res []*GroupInfo
 	for _, s := range stats {
 		res = append(res, &GroupInfo{
-			Group: s.Group,
-			Size:  s.Size,
+			Group:          s.Group,
+			Size:           s.Size,
+			OldestTaskAt:   fromUnixTimeOrZero(s.OldestAt),
+			NewestTaskAt:   fromUnixTimeOrZero(s.NewestAt),
+			Policy:         newGroupPolicy(s.Policy),
+			FlushRequested: s.FlushRequested,
 		})
 	}
 	return res, nil
@@ -82,6 +86,20 @@ type GroupInfo struct {
 
 	// Size is the total number of tasks in the group.
 	Size int
+
+	// OldestTaskAt is the time the oldest task of the group was added to it.
+	OldestTaskAt time.Time
+
+	// NewestTaskAt is the time the newest task of the group was added to it.
+	NewestTaskAt time.Time
+
+	// Policy is the aggregation policy last used for the group by a server, nil if unknown.
+	// Disabled conditions are negative.
+	Policy *GroupPolicy
+
+	// FlushRequested reports whether the group will be aggregated at the next check regardless of its policy
+	// (see FlushGroup).
+	FlushRequested bool
 }
 
 // QueueInfo represents a state of a queue at a certain time.
@@ -135,6 +153,13 @@ type QueueInfo struct {
 
 	// Time when this queue info snapshot was taken.
 	Timestamp time.Time
+
+	// Metadata holds the user defined information about the queue, such as its category (see SetQueueMetadata).
+	Metadata QueueMetadata
+
+	// RateLimit is the rate limit of the queue and its state, nil if the queue has no rate limit
+	// (see SetQueueRateLimit).
+	RateLimit *RateLimitInfo
 }
 
 // GetQueueInfo returns current information of the given queue.
@@ -146,7 +171,17 @@ func (i *Inspector) GetQueueInfo(queue string) (*QueueInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+	md, err := i.GetQueueMetadata(queue)
+	if err != nil {
+		return nil, err
+	}
+	rl, err := i.QueueRateLimit(queue)
+	if err != nil {
+		return nil, err
+	}
 	return &QueueInfo{
+		Metadata:       md,
+		RateLimit:      rl,
 		Queue:          stats.Queue,
 		MemoryUsage:    stats.MemoryUsage,
 		Latency:        stats.Latency,
@@ -1010,6 +1045,18 @@ func parseOption(s string) (Option, error) {
 			return nil, err
 		}
 		return Header(h[0], h[1]), nil
+	case "Group":
+		group, err := strconv.Unquote(arg)
+		if err != nil {
+			return nil, err
+		}
+		return Group(group), nil
+	case "RateLimitKey":
+		key, err := strconv.Unquote(arg)
+		if err != nil {
+			return nil, err
+		}
+		return RateLimitKey(key), nil
 	default:
 		return nil, fmt.Errorf("cannot not parse option string %q", s)
 	}

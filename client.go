@@ -63,6 +63,7 @@ const (
 	RetentionOpt
 	GroupOpt
 	HeaderOpt
+	RateLimitKeyOpt
 )
 
 // Option specifies the task processing behavior.
@@ -90,6 +91,7 @@ type (
 	retentionOption time.Duration
 	groupOption     string
 	headerOption    [2]string
+	rateLimitOption string
 )
 
 // MaxRetry returns an option to specify the max number of times
@@ -242,6 +244,20 @@ func (h headerOption) String() string {
 func (h headerOption) Type() OptionType   { return HeaderOpt }
 func (h headerOption) Value() interface{} { return [2]string{h[0], h[1]} }
 
+// RateLimitKey returns an option to subject the task to the rate limit configured for the given key
+// (see Inspector.SetRateLimit). The tasks enqueued with the same key share the rate limit, whatever their queue.
+//
+// When the rate limit has no capacity left, the server reserves the next free slot for the task: it waits for the
+// slot if it is close, or moves the task back to the scheduled state until the slot otherwise. Waiting for the rate
+// limit does not count as a retry. A key with no rate limit configured does not limit the task.
+func RateLimitKey(key string) Option {
+	return rateLimitOption(key)
+}
+
+func (key rateLimitOption) String() string     { return fmt.Sprintf("RateLimitKey(%q)", string(key)) }
+func (key rateLimitOption) Type() OptionType   { return RateLimitKeyOpt }
+func (key rateLimitOption) Value() interface{} { return string(key) }
+
 // ErrDuplicateTask indicates that the given task could not be enqueued since it's a duplicate of another task.
 //
 // ErrDuplicateTask error only applies to tasks enqueued with a Unique option.
@@ -263,6 +279,8 @@ type option struct {
 	retention time.Duration
 	group     string
 	headers   map[string]string
+	rateLimit string
+	flow      flowOption
 }
 
 // composeOptions merges user provided options into the default options
@@ -320,6 +338,14 @@ func composeOptions(opts ...Option) (option, error) {
 		case headerOption:
 			key, value := opt[0], opt[1]
 			res.headers[key] = value
+		case flowOption:
+			res.flow = opt
+		case rateLimitOption:
+			key := string(opt)
+			if isBlank(key) {
+				return option{}, errors.New("rate limit key cannot be empty")
+			}
+			res.rateLimit = key
 		default:
 			// ignore unexpected option
 		}
@@ -412,17 +438,22 @@ func (c *Client) EnqueueContext(ctx context.Context, task *Task, opts ...Option)
 		uniqueKey = base.UniqueKey(opt.queue, task.Type(), task.Payload())
 	}
 	msg := &base.TaskMessage{
-		ID:        opt.taskID,
-		Type:      task.Type(),
-		Payload:   task.Payload(),
-		Headers:   maps.Clone(task.Headers()),
-		Queue:     opt.queue,
-		Retry:     opt.retry,
-		Deadline:  deadline.Unix(),
-		Timeout:   int64(timeout.Seconds()),
-		UniqueKey: uniqueKey,
-		GroupKey:  opt.group,
-		Retention: int64(opt.retention.Seconds()),
+		ID:           opt.taskID,
+		Type:         task.Type(),
+		Payload:      task.Payload(),
+		Headers:      maps.Clone(task.Headers()),
+		Queue:        opt.queue,
+		Retry:        opt.retry,
+		Deadline:     deadline.Unix(),
+		Timeout:      int64(timeout.Seconds()),
+		UniqueKey:    uniqueKey,
+		GroupKey:     opt.group,
+		Retention:    int64(opt.retention.Seconds()),
+		EnqueuedAt:   time.Now().UnixMilli(),
+		RateLimitKey: opt.rateLimit,
+		Flow:         opt.flow.flow,
+		FlowRun:      opt.flow.run,
+		ParentID:     opt.flow.parent,
 	}
 	if len(opt.headers) > 0 {
 		if msg.Headers == nil {
@@ -545,15 +576,17 @@ func (c *Client) BatchEnqueueContext(ctx context.Context, tasks []*Task, opts ..
 			timeout = defaultTimeout
 		}
 		msg := &base.TaskMessage{
-			ID:        opt.taskID,
-			Type:      task.Type(),
-			Payload:   task.Payload(),
-			Headers:   task.Headers(),
-			Queue:     opt.queue,
-			Retry:     opt.retry,
-			Deadline:  deadline.Unix(),
-			Timeout:   int64(timeout.Seconds()),
-			Retention: int64(opt.retention.Seconds()),
+			ID:           opt.taskID,
+			Type:         task.Type(),
+			Payload:      task.Payload(),
+			Headers:      task.Headers(),
+			Queue:        opt.queue,
+			Retry:        opt.retry,
+			Deadline:     deadline.Unix(),
+			Timeout:      int64(timeout.Seconds()),
+			Retention:    int64(opt.retention.Seconds()),
+			EnqueuedAt:   time.Now().UnixMilli(),
+			RateLimitKey: opt.rateLimit,
 		}
 
 		now := time.Now()

@@ -54,6 +54,7 @@ type Server struct {
 	healthchecker *healthchecker
 	janitor       *janitor
 	aggregator    *aggregator
+	flowPublisher *flowPublisher
 }
 
 type serverState struct {
@@ -255,6 +256,16 @@ type Config struct {
 	// If unset or nil, the group aggregation feature will be disabled on the server.
 	GroupAggregator GroupAggregator
 
+	// GroupPolicy optionally returns the aggregation criteria of each group, so that groups can be aggregated
+	// differently, e.g. by batches of 10 for some and of 10000 for others. The zero fields of the returned policy
+	// take the values of GroupMaxSize, GroupGracePeriod and GroupMaxDelay (see GroupPolicy).
+	//
+	// If nil, every group uses GroupMaxSize, GroupGracePeriod and GroupMaxDelay.
+	//
+	// Note: groups are checked at most every GroupGracePeriod (and every 7 seconds at least), so a group's grace
+	// period or max delay shorter than that is only checked at that interval.
+	GroupPolicy func(queue, group string) GroupPolicy
+
 	// JanitorInterval specifies the average interval of janitor checks for expired completed tasks.
 	//
 	// If unset or zero, default interval of 8 seconds is used.
@@ -265,6 +276,19 @@ type Config struct {
 	// If unset or zero, default batch size of 100 is used.
 	// Make sure to not put a big number as the batch size to prevent a long-running script.
 	JanitorBatchSize int
+
+	// DisableTaskMetrics disables the recording of task metrics.
+	//
+	// By default, the server records, for every queue and task type, how many tasks were processed and failed,
+	// how long they took to process, and how long they waited in the pending state, in buckets of one minute
+	// (kept for 48 hours) and one hour (kept for 90 days). See Inspector.TaskMetrics.
+	// The metrics are written in the same redis call that ends the processing of a task.
+	DisableTaskMetrics bool
+
+	// Flows are the flows whose steps run on this server: when the server processes a task successfully, it
+	// enqueues the next tasks of the flows (see Flow). Register a flow on every server that processes the tasks
+	// that start its steps. The server publishes the flow definitions to redis so that tools can show them.
+	Flows []*Flow
 }
 
 // GroupAggregator aggregates a group of tasks into one before the tasks are passed to the Handler.
@@ -528,6 +552,7 @@ func NewServerFromRedisClient(c redis.UniversalClient, cfg Config) *Server {
 	logger.SetLevel(toInternalLogLevel(loglevel))
 
 	rdb := rdb.NewRDB(c)
+	rdb.SetTaskMetricsEnabled(!cfg.DisableTaskMetrics)
 	starting := make(chan *workerInfo)
 	finished := make(chan *base.TaskMessage)
 	syncCh := make(chan *syncRequest)
@@ -586,6 +611,7 @@ func NewServerFromRedisClient(c redis.UniversalClient, cfg Config) *Server {
 		shutdownTimeout:   shutdownTimeout,
 		starting:          starting,
 		finished:          finished,
+		flows:             cfg.Flows,
 	})
 	recoverer := newRecoverer(recovererParams{
 		logger:         logger,
@@ -630,6 +656,7 @@ func NewServerFromRedisClient(c redis.UniversalClient, cfg Config) *Server {
 		maxDelay:        cfg.GroupMaxDelay,
 		maxSize:         cfg.GroupMaxSize,
 		groupAggregator: cfg.GroupAggregator,
+		groupPolicy:     cfg.GroupPolicy,
 	})
 	return &Server{
 		logger:           logger,
@@ -645,6 +672,7 @@ func NewServerFromRedisClient(c redis.UniversalClient, cfg Config) *Server {
 		healthchecker:    healthchecker,
 		janitor:          janitor,
 		aggregator:       aggregator,
+		flowPublisher:    newFlowPublisher(logger, rdb, cfg.Flows),
 	}
 }
 
@@ -726,6 +754,7 @@ func (srv *Server) Start(handler Handler) error {
 	srv.processor.start(&srv.wg)
 	srv.janitor.start(&srv.wg)
 	srv.aggregator.start(&srv.wg)
+	srv.flowPublisher.start(&srv.wg)
 	return nil
 }
 
@@ -772,6 +801,7 @@ func (srv *Server) Shutdown() {
 	srv.subscriber.shutdown()
 	srv.janitor.shutdown()
 	srv.aggregator.shutdown()
+	srv.flowPublisher.shutdown()
 	srv.healthchecker.shutdown()
 	srv.heartbeater.shutdown()
 	srv.wg.Wait()

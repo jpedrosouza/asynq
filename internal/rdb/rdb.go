@@ -9,10 +9,10 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strconv"
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jpedrosouza/asynq/internal/base"
 	"github.com/jpedrosouza/asynq/internal/errors"
 	"github.com/jpedrosouza/asynq/internal/timeutil"
@@ -30,6 +30,9 @@ type RDB struct {
 	client          redis.UniversalClient
 	clock           timeutil.Clock
 	queuesPublished sync.Map
+
+	// noTaskMetrics disables the recording of task metrics (see base.TaskMetricsMinuteKey).
+	noTaskMetrics bool
 }
 
 // NewRDB returns a new instance of RDB.
@@ -334,40 +337,97 @@ func (r *RDB) EnqueueUnique(ctx context.Context, msg *base.TaskMessage, ttl time
 // KEYS[3] -> asynq:{<qname>}:active
 // KEYS[4] -> asynq:{<qname>}:lease
 // KEYS[5] -> asynq:{<qname>}:marker
+// KEYS[6] -> asynq:{<qname>}:ratelimit
+// KEYS[7] -> asynq:{<qname>}:ratelimit:tat
 // --
 // ARGV[1] -> initial lease expiration Unix time
 // ARGV[2] -> task key prefix
+// ARGV[3] -> current Unix time in milliseconds
 //
 // Output:
 // Returns nil if no processable task is found in the given queue.
-// Returns an encoded TaskMessage.
+// Returns an integer, the number of milliseconds to wait, if the queue has pending tasks but its rate
+// limit allows none at this time.
+// Returns an array of the encoded TaskMessage and the time the task became pending (in nsec, or an
+// empty string if unknown).
 //
 // Note: dequeueCmd checks whether a queue is paused first, before
 // calling RPOPLPUSH to pop a task from the queue. When tasks are left
 // pending, it sets the marker again: a blocking wait wakes a single
 // server, and the others must learn about the rest too.
+//
+// The rate limit of the queue is a GCRA (generic cell rate algorithm): KEYS[7] holds the theoretical
+// arrival time (TAT) of the next task, every dequeued task moves it forward by period/limit, and a task
+// may be dequeued while the TAT is at most burst-1 emission intervals ahead of the current time.
 var dequeueCmd = redis.NewScript(`
-if redis.call("EXISTS", KEYS[2]) == 0 then
-	local id = redis.call("RPOPLPUSH", KEYS[1], KEYS[3])
-	if id then
-		local key = ARGV[2] .. id
-		redis.call("HSET", key, "state", "active")
-		redis.call("HDEL", key, "pending_since")
-		redis.call("ZADD", KEYS[4], ARGV[1], id)
-		if redis.call("LLEN", KEYS[1]) > 0 then
-			redis.call("ZADD", KEYS[5], 0, "0")
+if redis.call("EXISTS", KEYS[2]) == 1 then
+	return nil
+end
+local cfg = redis.call("HMGET", KEYS[6], "limit", "period", "burst")
+local limit = tonumber(cfg[1]) or 0
+local now, emission, tat
+if limit > 0 then
+	if redis.call("LLEN", KEYS[1]) == 0 then
+		return nil
+	end
+	now = tonumber(ARGV[3])
+	emission = (tonumber(cfg[2]) or 1000) / limit
+	local burst = tonumber(cfg[3]) or 1
+	if burst < 1 then
+		burst = 1
+	end
+	tat = tonumber(redis.call("GET", KEYS[7])) or now
+	if tat < now then
+		tat = now
+	end
+	local allowAt = tat - emission * (burst - 1)
+	if allowAt > now then
+		local wait = math.ceil(allowAt - now)
+		if wait < 1 then
+			wait = 1
 		end
-		return redis.call("HGET", key, "msg")
+		return wait
 	end
 end
-return nil`)
+local id = redis.call("RPOPLPUSH", KEYS[1], KEYS[3])
+if not id then
+	return nil
+end
+if limit > 0 then
+	local newTat = tat + emission
+	redis.call("SET", KEYS[7], string.format("%.3f", newTat), "PX", math.ceil(newTat - now) + 1000)
+end
+local key = ARGV[2] .. id
+local pendingSince = redis.call("HGET", key, "pending_since") or ""
+redis.call("HSET", key, "state", "active")
+redis.call("HDEL", key, "pending_since")
+redis.call("ZADD", KEYS[4], ARGV[1], id)
+if redis.call("LLEN", KEYS[1]) > 0 then
+	redis.call("ZADD", KEYS[5], 0, "0")
+end
+return {redis.call("HGET", key, "msg"), pendingSince}`)
 
 // Dequeue queries given queues in order and pops a task message
 // off a queue if one exists and returns the message and its lease expiration time.
 // Dequeue skips a queue if the queue is paused.
 // If all queues are empty, ErrNoProcessableTask error is returned.
 func (r *RDB) Dequeue(qnames ...string) (msg *base.TaskMessage, leaseExpirationTime time.Time, err error) {
+	d, err := r.DequeueTask(qnames...)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	return d.Msg, d.LeaseExpiration, nil
+}
+
+// DequeueTask queries given queues in order and pops a task message off a queue if one exists.
+// It skips a queue if the queue is paused, or if the rate limit of the queue allows no task at this time.
+//
+// If no task could be dequeued, the error matches ErrNoProcessableTask. If some of the queues have pending
+// tasks but are rate limited, the error also wraps an *errors.RateLimitedError which tells when to try again.
+func (r *RDB) DequeueTask(qnames ...string) (*base.DequeuedTask, error) {
 	var op errors.Op = "rdb.Dequeue"
+	var limited []string
+	var retryIn time.Duration
 	for _, qname := range qnames {
 		keys := []string{
 			base.PendingKey(qname),
@@ -375,28 +435,60 @@ func (r *RDB) Dequeue(qnames ...string) (msg *base.TaskMessage, leaseExpirationT
 			base.ActiveKey(qname),
 			base.LeaseKey(qname),
 			base.MarkerKey(qname),
+			base.QueueRateLimitKey(qname),
+			base.QueueRateLimitStateKey(qname),
 		}
-		leaseExpirationTime = r.clock.Now().Add(LeaseDuration)
+		now := r.clock.Now()
+		leaseExpirationTime := now.Add(LeaseDuration)
 		argv := []interface{}{
 			leaseExpirationTime.Unix(),
 			base.TaskKeyPrefix(qname),
+			now.UnixMilli(),
 		}
 		res, err := dequeueCmd.Run(context.Background(), r.client, keys, argv...).Result()
 		if err == redis.Nil {
 			continue
 		} else if err != nil {
-			return nil, time.Time{}, errors.E(op, errors.Unknown, fmt.Errorf("redis eval error: %w", err))
+			return nil, errors.E(op, errors.Unknown, fmt.Errorf("redis eval error: %w", err))
 		}
-		encoded, err := cast.ToStringE(res)
-		if err != nil {
-			return nil, time.Time{}, errors.E(op, errors.Internal, fmt.Sprintf("cast error: unexpected return value from Lua script: %v", res))
+		switch v := res.(type) {
+		case int64:
+			wait := time.Duration(v) * time.Millisecond
+			if len(limited) == 0 || wait < retryIn {
+				retryIn = wait
+			}
+			limited = append(limited, qname)
+			continue
+		case []interface{}:
+			if len(v) != 2 {
+				return nil, errors.E(op, errors.Internal, fmt.Sprintf("unexpected return value from Lua script: %v", res))
+			}
+			if v[0] == nil {
+				continue // the task data is missing
+			}
+			encoded, err := cast.ToStringE(v[0])
+			if err != nil {
+				return nil, errors.E(op, errors.Internal, fmt.Sprintf("cast error: unexpected return value from Lua script: %v", res))
+			}
+			msg, err := base.DecodeMessage([]byte(encoded))
+			if err != nil {
+				return nil, errors.E(op, errors.Internal, fmt.Sprintf("cannot decode message: %v", err))
+			}
+			var pendingSince time.Time
+			if s, ok := v[1].(string); ok && s != "" {
+				if ns, err := strconv.ParseInt(s, 10, 64); err == nil && ns > 0 {
+					pendingSince = time.Unix(0, ns)
+				}
+			}
+			return &base.DequeuedTask{Msg: msg, LeaseExpiration: leaseExpirationTime, PendingSince: pendingSince}, nil
+		default:
+			return nil, errors.E(op, errors.Internal, fmt.Sprintf("unexpected return value from Lua script: %v", res))
 		}
-		if msg, err = base.DecodeMessage([]byte(encoded)); err != nil {
-			return nil, time.Time{}, errors.E(op, errors.Internal, fmt.Sprintf("cannot decode message: %v", err))
-		}
-		return msg, leaseExpirationTime, nil
 	}
-	return nil, time.Time{}, errors.E(op, errors.NotFound, errors.ErrNoProcessableTask)
+	if len(limited) > 0 {
+		return nil, errors.E(op, errors.NotFound, &errors.RateLimitedError{Queues: limited, RetryIn: retryIn})
+	}
+	return nil, errors.E(op, errors.NotFound, errors.ErrNoProcessableTask)
 }
 
 // WaitForTask blocks until a task may have become pending in one of the queues, or until the
@@ -446,7 +538,7 @@ if tonumber(total) == tonumber(ARGV[3]) then
 else
 	redis.call("INCR", KEYS[5])
 end
-return redis.status_reply("OK")
+` + recordTaskMetricsLua + `return redis.status_reply("OK")
 `)
 
 // KEYS[1] -> asynq:{<qname>}:active
@@ -482,7 +574,7 @@ end
 if redis.call("GET", KEYS[6]) == ARGV[1] then
   redis.call("DEL", KEYS[6])
 end
-return redis.status_reply("OK")
+` + recordTaskMetricsLua + `return redis.status_reply("OK")
 `)
 
 // Done removes the task from active queue and deletes the task.
@@ -506,8 +598,10 @@ func (r *RDB) Done(ctx context.Context, msg *base.TaskMessage) error {
 	// Note: We cannot pass empty unique key when running this script in redis-cluster.
 	if len(msg.UniqueKey) > 0 {
 		keys = append(keys, msg.UniqueKey)
+		keys, argv = r.appendTaskMetricsArgs(keys, argv, msg, now, true)
 		return r.runScript(ctx, op, doneUniqueCmd, keys, argv...)
 	}
+	keys, argv = r.appendTaskMetricsArgs(keys, argv, msg, now, true)
 	return r.runScript(ctx, op, doneCmd, keys, argv...)
 }
 
@@ -544,7 +638,7 @@ if tonumber(total) == tonumber(ARGV[5]) then
 else
 	redis.call("INCR", KEYS[6])
 end
-return redis.status_reply("OK")
+` + recordTaskMetricsLua + `return redis.status_reply("OK")
 `)
 
 // KEYS[1] -> asynq:{<qname>}:active
@@ -584,7 +678,7 @@ end
 if redis.call("GET", KEYS[7]) == ARGV[1] then
   redis.call("DEL", KEYS[7])
 end
-return redis.status_reply("OK")
+` + recordTaskMetricsLua + `return redis.status_reply("OK")
 `)
 
 // MarkAsComplete removes the task from active queue to mark the task as completed.
@@ -616,8 +710,10 @@ func (r *RDB) MarkAsComplete(ctx context.Context, msg *base.TaskMessage) error {
 	// Note: We cannot pass empty unique key when running this script in redis-cluster.
 	if len(msg.UniqueKey) > 0 {
 		keys = append(keys, msg.UniqueKey)
+		keys, argv = r.appendTaskMetricsArgs(keys, argv, msg, now, true)
 		return r.runScript(ctx, op, markAsCompleteUniqueCmd, keys, argv...)
 	}
+	keys, argv = r.appendTaskMetricsArgs(keys, argv, msg, now, true)
 	return r.runScript(ctx, op, markAsCompleteCmd, keys, argv...)
 }
 
@@ -943,7 +1039,7 @@ if tonumber(ARGV[5]) == 1 then
     	redis.call("INCR", KEYS[8])
     end
 end
-return redis.status_reply("OK")`)
+` + recordTaskMetricsLua + `return redis.status_reply("OK")`)
 
 // Retry moves the task from active to retry queue.
 // It also annotates the message with the given error message and
@@ -979,6 +1075,11 @@ func (r *RDB) Retry(ctx context.Context, msg *base.TaskMessage, processAt time.T
 		expireAt.Unix(),
 		isFailure,
 		int64(math.MaxInt64),
+	}
+	if isFailure {
+		keys, argv = r.appendTaskMetricsArgs(keys, argv, &modified, now, false)
+	} else {
+		keys, argv = r.appendNoTaskMetricsArgs(keys, argv, msg.Queue, now)
 	}
 	return r.runScript(ctx, op, retryCmd, keys, argv...)
 }
@@ -1046,7 +1147,7 @@ else
   	redis.call("INCR", KEYS[7])
    	redis.call("INCR", KEYS[8])
 end
-return redis.status_reply("OK")`)
+` + recordTaskMetricsLua + `return redis.status_reply("OK")`)
 
 // Archive sends the given task to archive, attaching the error message to the task.
 // It also trims the archive by timestamp and set size.
@@ -1082,6 +1183,7 @@ func (r *RDB) Archive(ctx context.Context, msg *base.TaskMessage, errMsg string)
 		expireAt.Unix(),
 		int64(math.MaxInt64),
 	}
+	keys, argv = r.appendTaskMetricsArgs(keys, argv, &modified, now, false)
 	return r.runScript(ctx, op, archiveCmd, keys, argv...)
 }
 
@@ -1183,89 +1285,6 @@ func (r *RDB) ListGroups(qname string) ([]string, error) {
 	return groups, nil
 }
 
-// aggregationCheckCmd checks the given group for whether to create an aggregation set.
-// An aggregation set is created if one of the aggregation criteria is met:
-// 1) group has reached or exceeded its max size
-// 2) group's oldest task has reached or exceeded its max delay
-// 3) group's latest task has reached or exceeded its grace period
-// if aggreation criteria is met, the command moves those tasks from the group
-// and put them in an aggregation set. Additionally, if the creation of aggregation set
-// empties the group, it will clear the group name from the all groups set.
-//
-// KEYS[1] -> asynq:{<qname>}:g:<gname>
-// KEYS[2] -> asynq:{<qname>}:g:<gname>:<aggregation_set_id>
-// KEYS[3] -> asynq:{<qname>}:aggregation_sets
-// KEYS[4] -> asynq:{<qname>}:groups
-// -------
-// ARGV[1] -> max group size
-// ARGV[2] -> max group delay in unix time
-// ARGV[3] -> start time of the grace period
-// ARGV[4] -> aggregation set expire time
-// ARGV[5] -> current time in unix time
-// ARGV[6] -> group name
-//
-// Output:
-// Returns 0 if no aggregation set was created
-// Returns 1 if an aggregation set was created
-//
-// Time Complexity:
-// O(log(N) + M) with N being the number tasks in the group zset
-// and M being the max size.
-var aggregationCheckCmd = redis.NewScript(`
-local size = redis.call("ZCARD", KEYS[1])
-if size == 0 then
-	return 0
-end
-local maxSize = tonumber(ARGV[1])
-if maxSize ~= 0 and size >= maxSize then
-	local res = redis.call("ZRANGE", KEYS[1], 0, maxSize-1, "WITHSCORES")
-	for i=1, table.getn(res)-1, 2 do
-		redis.call("ZADD", KEYS[2], tonumber(res[i+1]), res[i])
-	end
-	redis.call("ZREMRANGEBYRANK", KEYS[1], 0, maxSize-1)
-	redis.call("ZADD", KEYS[3], ARGV[4], KEYS[2])
-	if size == maxSize then
-		redis.call("SREM", KEYS[4], ARGV[6])
-	end
-	return 1
-end
-local maxDelay = tonumber(ARGV[2])
-local currentTime = tonumber(ARGV[5])
-if maxDelay ~= 0 then
-	local oldestEntry = redis.call("ZRANGE", KEYS[1], 0, 0, "WITHSCORES")
-	local oldestEntryScore = tonumber(oldestEntry[2])
-	local maxDelayTime = currentTime - maxDelay
-	if oldestEntryScore <= maxDelayTime then
-		local res = redis.call("ZRANGE", KEYS[1], 0, maxSize-1, "WITHSCORES")
-		for i=1, table.getn(res)-1, 2 do
-			redis.call("ZADD", KEYS[2], tonumber(res[i+1]), res[i])
-		end
-		redis.call("ZREMRANGEBYRANK", KEYS[1], 0, maxSize-1)
-		redis.call("ZADD", KEYS[3], ARGV[4], KEYS[2])
-		if size <= maxSize or maxSize == 0 then
-			redis.call("SREM", KEYS[4], ARGV[6])
-		end
-		return 1
-	end
-end
-local latestEntry = redis.call("ZREVRANGE", KEYS[1], 0, 0, "WITHSCORES")
-local latestEntryScore = tonumber(latestEntry[2])
-local gracePeriodStartTime = currentTime - tonumber(ARGV[3])
-if latestEntryScore <= gracePeriodStartTime then
-	local res = redis.call("ZRANGE", KEYS[1], 0, maxSize-1, "WITHSCORES")
-	for i=1, table.getn(res)-1, 2 do
-		redis.call("ZADD", KEYS[2], tonumber(res[i+1]), res[i])
-	end
-	redis.call("ZREMRANGEBYRANK", KEYS[1], 0, maxSize-1)
-	redis.call("ZADD", KEYS[3], ARGV[4], KEYS[2])
-	if size <= maxSize or maxSize == 0 then
-		redis.call("SREM", KEYS[4], ARGV[6])
-	end
-	return 1
-end
-return 0
-`)
-
 // Task aggregation should finish within this timeout.
 // Otherwise an aggregation set should be reclaimed by the recoverer.
 const aggregationTimeout = 2 * time.Minute
@@ -1278,35 +1297,11 @@ const aggregationTimeout = 2 * time.Minute
 // Note: It assumes that this function is called at frequency less than or equal to the gracePeriod. In other words,
 // the function only checks the most recently added task against the given gracePeriod.
 func (r *RDB) AggregationCheck(qname, gname string, t time.Time, gracePeriod, maxDelay time.Duration, maxSize int) (string, error) {
-	var op errors.Op = "RDB.AggregationCheck"
-	aggregationSetID := uuid.NewString()
-	expireTime := r.clock.Now().Add(aggregationTimeout)
-	keys := []string{
-		base.GroupKey(qname, gname),
-		base.AggregationSetKey(qname, gname, aggregationSetID),
-		base.AllAggregationSets(qname),
-		base.AllGroups(qname),
-	}
-	argv := []interface{}{
-		maxSize,
-		int64(maxDelay.Seconds()),
-		int64(gracePeriod.Seconds()),
-		expireTime.Unix(),
-		t.Unix(),
-		gname,
-	}
-	n, err := r.runScriptWithErrorCode(context.Background(), op, aggregationCheckCmd, keys, argv...)
-	if err != nil {
-		return "", err
-	}
-	switch n {
-	case 0:
-		return "", nil
-	case 1:
-		return aggregationSetID, nil
-	default:
-		return "", errors.E(op, errors.Internal, fmt.Sprintf("unexpected return value from lua script: %d", n))
-	}
+	return r.AggregationCheckPolicy(qname, gname, t, base.GroupPolicy{
+		MaxSize:        maxSize,
+		GracePeriodSec: int64(gracePeriod.Seconds()),
+		MaxDelaySec:    int64(maxDelay.Seconds()),
+	})
 }
 
 // KEYS[1] -> asynq:{<qname>}:g:<gname>:<aggregation_set_id>

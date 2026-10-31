@@ -15,6 +15,7 @@ import (
 	"log"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // Error is the type that implements the error interface.
@@ -238,6 +239,19 @@ func IsTaskAlreadyArchived(err error) bool {
 	var target *TaskAlreadyArchivedError
 	return As(err, &target)
 }
+
+// RateLimitedError indicates that pending tasks could not be dequeued because their queues
+// are rate limited. It matches ErrNoProcessableTask.
+type RateLimitedError struct {
+	Queues  []string      // names of the rate limited queues
+	RetryIn time.Duration // shortest time until one of the queues allows a task again
+}
+
+func (e *RateLimitedError) Error() string {
+	return fmt.Sprintf("queues %v are rate limited, retry in %v", e.Queues, e.RetryIn)
+}
+
+func (e *RateLimitedError) Is(target error) bool { return target == ErrNoProcessableTask }
 
 // RedisCommandError indicates that the given redis command returned error.
 type RedisCommandError struct {

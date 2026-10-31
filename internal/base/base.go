@@ -23,7 +23,7 @@ import (
 )
 
 // Version of asynq library and CLI.
-const Version = "0.27.1"
+const Version = "0.28.0"
 
 // DefaultQueueName is the queue name used if none are specified by user.
 const DefaultQueueName = "default"
@@ -304,6 +304,43 @@ type TaskMessage struct {
 	//
 	// Use zero to indicate no value.
 	CompletedAt int64
+
+	// EnqueuedAt is the time the task was first enqueued in Unix time with millisecond precision.
+	// It is kept as is through retries.
+	//
+	// Use zero to indicate no value.
+	EnqueuedAt int64
+
+	// StartedAt is the time the last processing attempt started in Unix time with millisecond precision.
+	//
+	// Use zero to indicate no value.
+	StartedAt int64
+
+	// DurationMs is the duration of the last processing attempt in milliseconds.
+	DurationMs int64
+
+	// WaitMs is the time the task waited in the pending list before its last processing attempt started,
+	// in milliseconds. Negative value indicates that the wait time is unknown.
+	WaitMs int64
+
+	// RateLimitKey names the key level rate limit that applies to the task.
+	//
+	// Empty string indicates no key level rate limit.
+	RateLimitKey string
+
+	// RateLimitSlot is the rate limit slot reserved for the task in Unix time with millisecond precision.
+	//
+	// Use zero to indicate no reserved slot.
+	RateLimitSlot int64
+
+	// Flow is the name of the flow that enqueued the task, empty if none.
+	Flow string
+
+	// FlowRun is the ID of the flow run the task belongs to, empty if none.
+	FlowRun string
+
+	// ParentID is the ID of the task whose completion enqueued this task in the flow run, empty if none.
+	ParentID string
 }
 
 // EncodeMessage marshals the given task message and returns an encoded bytes.
@@ -312,21 +349,30 @@ func EncodeMessage(msg *TaskMessage) ([]byte, error) {
 		return nil, fmt.Errorf("cannot encode nil message")
 	}
 	return proto.Marshal(&pb.TaskMessage{
-		Type:         msg.Type,
-		Payload:      msg.Payload,
-		Headers:      msg.Headers,
-		Id:           msg.ID,
-		Queue:        msg.Queue,
-		Retry:        int32(msg.Retry),
-		Retried:      int32(msg.Retried),
-		ErrorMsg:     msg.ErrorMsg,
-		LastFailedAt: msg.LastFailedAt,
-		Timeout:      msg.Timeout,
-		Deadline:     msg.Deadline,
-		UniqueKey:    msg.UniqueKey,
-		GroupKey:     msg.GroupKey,
-		Retention:    msg.Retention,
-		CompletedAt:  msg.CompletedAt,
+		Type:          msg.Type,
+		Payload:       msg.Payload,
+		Headers:       msg.Headers,
+		Id:            msg.ID,
+		Queue:         msg.Queue,
+		Retry:         int32(msg.Retry),
+		Retried:       int32(msg.Retried),
+		ErrorMsg:      msg.ErrorMsg,
+		LastFailedAt:  msg.LastFailedAt,
+		Timeout:       msg.Timeout,
+		Deadline:      msg.Deadline,
+		UniqueKey:     msg.UniqueKey,
+		GroupKey:      msg.GroupKey,
+		Retention:     msg.Retention,
+		CompletedAt:   msg.CompletedAt,
+		EnqueuedAt:    msg.EnqueuedAt,
+		StartedAt:     msg.StartedAt,
+		DurationMs:    msg.DurationMs,
+		WaitMs:        msg.WaitMs,
+		RateLimitKey:  msg.RateLimitKey,
+		RateLimitSlot: msg.RateLimitSlot,
+		Flow:          msg.Flow,
+		FlowRun:       msg.FlowRun,
+		ParentId:      msg.ParentID,
 	})
 }
 
@@ -337,21 +383,30 @@ func DecodeMessage(data []byte) (*TaskMessage, error) {
 		return nil, err
 	}
 	return &TaskMessage{
-		Type:         pbmsg.GetType(),
-		Payload:      pbmsg.GetPayload(),
-		Headers:      pbmsg.GetHeaders(),
-		ID:           pbmsg.GetId(),
-		Queue:        pbmsg.GetQueue(),
-		Retry:        int(pbmsg.GetRetry()),
-		Retried:      int(pbmsg.GetRetried()),
-		ErrorMsg:     pbmsg.GetErrorMsg(),
-		LastFailedAt: pbmsg.GetLastFailedAt(),
-		Timeout:      pbmsg.GetTimeout(),
-		Deadline:     pbmsg.GetDeadline(),
-		UniqueKey:    pbmsg.GetUniqueKey(),
-		GroupKey:     pbmsg.GetGroupKey(),
-		Retention:    pbmsg.GetRetention(),
-		CompletedAt:  pbmsg.GetCompletedAt(),
+		Type:          pbmsg.GetType(),
+		Payload:       pbmsg.GetPayload(),
+		Headers:       pbmsg.GetHeaders(),
+		ID:            pbmsg.GetId(),
+		Queue:         pbmsg.GetQueue(),
+		Retry:         int(pbmsg.GetRetry()),
+		Retried:       int(pbmsg.GetRetried()),
+		ErrorMsg:      pbmsg.GetErrorMsg(),
+		LastFailedAt:  pbmsg.GetLastFailedAt(),
+		Timeout:       pbmsg.GetTimeout(),
+		Deadline:      pbmsg.GetDeadline(),
+		UniqueKey:     pbmsg.GetUniqueKey(),
+		GroupKey:      pbmsg.GetGroupKey(),
+		Retention:     pbmsg.GetRetention(),
+		CompletedAt:   pbmsg.GetCompletedAt(),
+		EnqueuedAt:    pbmsg.GetEnqueuedAt(),
+		StartedAt:     pbmsg.GetStartedAt(),
+		DurationMs:    pbmsg.GetDurationMs(),
+		WaitMs:        pbmsg.GetWaitMs(),
+		RateLimitKey:  pbmsg.GetRateLimitKey(),
+		RateLimitSlot: pbmsg.GetRateLimitSlot(),
+		Flow:          pbmsg.GetFlow(),
+		FlowRun:       pbmsg.GetFlowRun(),
+		ParentID:      pbmsg.GetParentId(),
 	}, nil
 }
 
@@ -699,6 +754,15 @@ type BatchEnqueueItem struct {
 	ProcessAt time.Time // zero value → immediate
 }
 
+// DequeuedTask is a task message popped off a queue along with its processing metadata.
+type DequeuedTask struct {
+	Msg *TaskMessage
+	// LeaseExpiration is the expiration time of the lease acquired on the task.
+	LeaseExpiration time.Time
+	// PendingSince is the time the task became pending, zero if unknown.
+	PendingSince time.Time
+}
+
 // Broker is a message broker that supports operations to manage task queues.
 //
 // See rdb.RDB as a reference implementation.
@@ -714,6 +778,10 @@ type Broker interface {
 	// batch as a whole is not transactional — partial success is possible.
 	BatchEnqueue(ctx context.Context, items []BatchEnqueueItem) (int, error)
 	Dequeue(qnames ...string) (*TaskMessage, time.Time, error)
+	// DequeueTask is like Dequeue, and also reports when the task became pending.
+	// If no task can be dequeued because the queues with pending tasks are rate limited, the returned
+	// error matches errors.ErrNoProcessableTask and wraps an *errors.RateLimitedError.
+	DequeueTask(qnames ...string) (*DequeuedTask, error)
 	Done(ctx context.Context, msg *TaskMessage) error
 	MarkAsComplete(ctx context.Context, msg *TaskMessage) error
 	Requeue(ctx context.Context, msg *TaskMessage) error
@@ -722,12 +790,26 @@ type Broker interface {
 	Retry(ctx context.Context, msg *TaskMessage, processAt time.Time, errMsg string, isFailure bool) error
 	Archive(ctx context.Context, msg *TaskMessage, errMsg string) error
 	ForwardIfReady(qnames ...string) error
+	// Defer moves an active task back to the scheduled set without counting a failure.
+	Defer(ctx context.Context, msg *TaskMessage, processAt time.Time) error
+
+	// Rate limit related methods
+	// ReserveRateLimit reserves a slot in the key level rate limit and returns its time,
+	// or the zero time if no rate limit is configured for the key.
+	ReserveRateLimit(ctx context.Context, key string) (time.Time, error)
 
 	// Group aggregation related methods
 	AddToGroup(ctx context.Context, msg *TaskMessage, gname string) error
 	AddToGroupUnique(ctx context.Context, msg *TaskMessage, groupKey string, ttl time.Duration) error
 	ListGroups(qname string) ([]string, error)
 	AggregationCheck(qname, gname string, t time.Time, gracePeriod, maxDelay time.Duration, maxSize int) (aggregationSetID string, err error)
+	// AggregationCheckPolicy is like AggregationCheck with the criteria of the given policy, and also aggregates a
+	// group whose flush was requested.
+	AggregationCheckPolicy(qname, gname string, t time.Time, policy GroupPolicy) (aggregationSetID string, err error)
+	// PublishGroupPolicies records the aggregation policies used for the groups of the queue.
+	PublishGroupPolicies(qname string, policies map[string]GroupPolicy) error
+	// AddToArchive adds a task message that does not exist yet straight to the archive.
+	AddToArchive(ctx context.Context, msg *TaskMessage) error
 	ReadAggregationSet(qname, gname, aggregationSetID string) ([]*TaskMessage, time.Time, error)
 	DeleteAggregationSet(ctx context.Context, qname, gname, aggregationSetID string) error
 	ReclaimStaleAggregationSets(qname string) error
@@ -748,4 +830,9 @@ type Broker interface {
 	PublishCancelation(id string) error
 
 	WriteResult(qname, id string, data []byte) (n int, err error)
+
+	// Flow related methods
+	UpdateFlowRun(ctx context.Context, runID string, meta *FlowRunMeta, nodes []*FlowNode) error
+	GetFlowRun(runID string) (*FlowRun, error)
+	PublishFlows(defs []*FlowDefinition) error
 }

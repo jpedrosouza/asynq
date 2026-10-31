@@ -507,7 +507,7 @@ func TestGroupStats(t *testing.T) {
 			if err != nil {
 				t.Fatalf("GroupStats returned error: %v", err)
 			}
-			if diff := cmp.Diff(tc.want, got, sortGroupStatsOpt); diff != "" {
+			if diff := cmp.Diff(tc.want, got, sortGroupStatsOpt, cmpopts.IgnoreFields(GroupStat{}, "OldestAt", "NewestAt")); diff != "" {
 				t.Errorf("GroupStats = %v, want %v; (-want,+got)\n%s", got, tc.want, diff)
 			}
 		})

@@ -11,6 +11,7 @@ import (
 	"math/rand/v2"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -74,6 +75,9 @@ type processor struct {
 
 	starting chan<- *workerInfo
 	finished chan<- *base.TaskMessage
+
+	// flows runs the flow steps that follow the processed tasks.
+	flows *flowRunner
 }
 
 type processorParams struct {
@@ -93,6 +97,7 @@ type processorParams struct {
 	shutdownTimeout   time.Duration
 	starting          chan<- *workerInfo
 	finished          chan<- *base.TaskMessage
+	flows             []*Flow
 }
 
 // newProcessor constructs a new processor.
@@ -125,6 +130,7 @@ func newProcessor(params processorParams) *processor {
 		shutdownTimeout:   params.shutdownTimeout,
 		starting:          params.starting,
 		finished:          params.finished,
+		flows:             newFlowRunner(params.logger, params.broker, params.flows),
 	}
 }
 
@@ -211,9 +217,16 @@ func (p *processor) exec() {
 		return
 	case p.sema <- struct{}{}: // acquire token
 		qnames := p.queues()
-		msg, leaseExpirationTime, err := p.broker.Dequeue(qnames...)
+		dequeued, err := p.broker.DequeueTask(qnames...)
 		switch {
 		case errors.Is(err, errors.ErrNoProcessableTask):
+			var limited *errors.RateLimitedError
+			if errors.As(err, &limited) {
+				p.logger.Debugf("Queues %v are rate limited", limited.Queues)
+				p.waitForRateLimit(qnames, limited)
+				<-p.sema // release token
+				return
+			}
 			p.logger.Debug("All queues are empty")
 			// Queues are empty, this is a normal behavior.
 			if p.waiter != nil {
@@ -236,7 +249,14 @@ func (p *processor) exec() {
 			return
 		}
 
-		lease := base.NewLease(leaseExpirationTime)
+		msg := dequeued.Msg
+		lease := base.NewLease(dequeued.LeaseExpiration)
+		startDelay, ok := p.applyKeyRateLimit(lease, msg)
+		if !ok {
+			// The task was deferred until its rate limit allows it.
+			<-p.sema // release token
+			return
+		}
 		deadline := p.computeDeadline(msg)
 		p.starting <- &workerInfo{msg, time.Now(), deadline, lease}
 		go func() {
@@ -245,7 +265,30 @@ func (p *processor) exec() {
 				<-p.sema // release token
 			}()
 
+			if startDelay > 0 {
+				// Wait for the slot reserved in the rate limit of the task.
+				timer := time.NewTimer(startDelay)
+				select {
+				case <-timer.C:
+				case <-p.abort:
+					timer.Stop()
+					p.requeue(lease, msg)
+					return
+				}
+			}
+
+			start := p.clock.Now()
+			msg.StartedAt = start.UnixMilli()
+			msg.DurationMs = 0
+			msg.WaitMs = -1
+			if !dequeued.PendingSince.IsZero() {
+				msg.WaitMs = max(start.Sub(dequeued.PendingSince).Milliseconds(), 0)
+			}
+			setDuration := func() { msg.DurationMs = max(p.clock.Now().Sub(start).Milliseconds(), 0) }
+
 			ctx, cancel := asynqcontext.New(p.baseCtxFn(), msg, deadline)
+			fc := newFlowContext(p.flows, msg)
+			ctx = context.WithValue(ctx, flowContextKey{}, fc)
 			p.cancelations.Add(msg.ID, cancel)
 			defer func() {
 				cancel()
@@ -261,18 +304,17 @@ func (p *processor) exec() {
 			default:
 			}
 
+			p.flows.onStart(ctx, msg)
+
+			rw := &ResultWriter{
+				id:     msg.ID,
+				qname:  msg.Queue,
+				broker: p.broker,
+				ctx:    ctx,
+			}
 			resCh := make(chan error, 1)
 			go func() {
-				task := newTask(
-					msg.Type,
-					msg.Payload,
-					&ResultWriter{
-						id:     msg.ID,
-						qname:  msg.Queue,
-						broker: p.broker,
-						ctx:    ctx,
-					},
-				)
+				task := newTask(msg.Type, msg.Payload, rw)
 				task.headers = msg.Headers
 				resCh <- p.perform(ctx, task)
 			}()
@@ -285,19 +327,114 @@ func (p *processor) exec() {
 				return
 			case <-lease.Done():
 				cancel()
+				setDuration()
+				fc.apply(msg)
 				p.handleFailedMessage(ctx, lease, msg, ErrLeaseExpired)
 				return
 			case <-ctx.Done():
+				setDuration()
+				fc.apply(msg)
 				p.handleFailedMessage(ctx, lease, msg, ctx.Err())
 				return
 			case resErr := <-resCh:
+				setDuration()
+				fc.apply(msg)
 				if resErr != nil {
 					p.handleFailedMessage(ctx, lease, msg, resErr)
+					return
+				}
+				if err := p.runFlowSteps(lease, msg, rw.lastResult()); err != nil {
+					p.handleFailedMessage(ctx, lease, msg, err)
 					return
 				}
 				p.handleSucceededMessage(lease, msg)
 			}
 		}()
+	}
+}
+
+// maxInlineRateLimitWait is the longest time a worker waits for the slot reserved in the rate limit of a task.
+// A task whose slot is further away is deferred: moved back to the scheduled set until its slot.
+const maxInlineRateLimitWait = 2 * time.Second
+
+// applyKeyRateLimit applies the key level rate limit of the task, if any.
+// It returns how long to wait before processing the task, and false if the task was deferred instead and must
+// not be processed now.
+func (p *processor) applyKeyRateLimit(l *base.Lease, msg *base.TaskMessage) (time.Duration, bool) {
+	if msg.RateLimitKey == "" {
+		return 0, true
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), l.Deadline())
+	defer cancel()
+	var slot time.Time
+	if msg.RateLimitSlot > 0 {
+		// The task already reserved a slot when it was deferred.
+		slot = time.UnixMilli(msg.RateLimitSlot)
+	} else {
+		s, err := p.broker.ReserveRateLimit(ctx, msg.RateLimitKey)
+		if err != nil {
+			// Do not hold the task up when redis cannot tell: process it now.
+			if p.errLogLimiter.Allow() {
+				p.logger.Errorf("Could not reserve the rate limit %q for task id=%s: %v", msg.RateLimitKey, msg.ID, err)
+			}
+			return 0, true
+		}
+		if s.IsZero() {
+			return 0, true // no rate limit is configured for the key
+		}
+		slot = s
+	}
+	msg.RateLimitSlot = 0 // a retry reserves a new slot
+	wait := slot.Sub(p.clock.Now())
+	if wait <= maxInlineRateLimitWait {
+		return max(wait, 0), true
+	}
+	deferred := *msg
+	deferred.RateLimitSlot = slot.UnixMilli()
+	if err := p.broker.Defer(ctx, &deferred, slot); err != nil {
+		errMsg := fmt.Sprintf("Could not defer task id=%s until its rate limit %q allows it", msg.ID, msg.RateLimitKey)
+		p.logger.Warnf("%s; Will retry syncing", errMsg)
+		p.syncRequestCh <- &syncRequest{
+			fn: func() error {
+				ctx, cancel := context.WithDeadline(context.Background(), l.Deadline())
+				defer cancel()
+				return p.broker.Defer(ctx, &deferred, slot)
+			},
+			errMsg:   errMsg,
+			deadline: l.Deadline(),
+		}
+	} else {
+		p.logger.Debugf("Deferred task id=%s until %v (rate limit %q)", msg.ID, slot, msg.RateLimitKey)
+	}
+	return 0, false
+}
+
+// waitForRateLimit waits until a rate limited queue may allow a task again, or a task may have been enqueued in
+// one of the other queues.
+func (p *processor) waitForRateLimit(qnames []string, limited *errors.RateLimitedError) {
+	wait := min(limited.RetryIn, p.taskCheckInterval)
+	if wait <= 0 {
+		wait = time.Millisecond
+	}
+	// A blocking wait cannot be shorter than a second; fall back to sleeping for shorter waits.
+	if p.waiter != nil && wait >= time.Second {
+		var others []string
+		for _, q := range qnames {
+			if !slices.Contains(limited.Queues, q) {
+				others = append(others, q)
+			}
+		}
+		if len(others) > 0 {
+			if err := p.waiter.WaitForTask(context.Background(), wait, others...); err == nil {
+				return
+			}
+		}
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-p.quit:
+	case <-timer.C:
 	}
 }
 
@@ -314,6 +451,20 @@ func (p *processor) requeue(l *base.Lease, msg *base.TaskMessage) {
 	} else {
 		p.logger.Infof("Pushed task id=%s back to queue", msg.ID)
 	}
+}
+
+// runFlowSteps runs the flow steps that follow the task, if any.
+func (p *processor) runFlowSteps(l *base.Lease, msg *base.TaskMessage, result []byte) error {
+	if p.flows == nil || (p.flows.reg.empty() && msg.FlowRun == "") {
+		return nil
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), l.Deadline())
+	defer cancel()
+	err := p.flows.onSuccess(ctx, msg, result)
+	if err != nil {
+		p.logger.Errorf("Flow steps after task id=%s failed: %v", msg.ID, err)
+	}
+	return err
 }
 
 func (p *processor) handleSucceededMessage(l *base.Lease, msg *base.TaskMessage) {
@@ -386,8 +537,13 @@ func (p *processor) handleFailedMessage(ctx context.Context, l *base.Lease, msg 
 	case msg.Retried >= msg.Retry || errors.Is(err, SkipRetry):
 		p.logger.Warnf("Retry exhausted for task id=%s", msg.ID)
 		p.archive(l, msg, err)
+		p.flows.onFailure(ctx, msg, true, err.Error())
 	default:
-		p.retry(l, msg, err, p.isFailureFunc(err))
+		isFailure := p.isFailureFunc(err)
+		p.retry(l, msg, err, isFailure)
+		if isFailure {
+			p.flows.onFailure(ctx, msg, false, err.Error())
+		}
 	}
 }
 

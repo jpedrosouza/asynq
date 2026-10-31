@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jpedrosouza/asynq/internal/base"
@@ -35,6 +36,9 @@ type Task struct {
 
 	// w is the ResultWriter for the task.
 	w *ResultWriter
+
+	// member is the message of the task when the task is passed to a GroupAggregator.
+	member *base.TaskMessage
 }
 
 func (t *Task) Type() string               { return t.typename }
@@ -153,6 +157,45 @@ type TaskInfo struct {
 	// Result holds the result data associated with the task.
 	// Use ResultWriter to write result data from the Handler.
 	Result []byte
+
+	// EnqueuedAt is the time the task was first enqueued.
+	// Zero value indicates no value (e.g. the task was enqueued by an older version of the library).
+	EnqueuedAt time.Time
+
+	// StartedAt is the time the last processing attempt of the task started.
+	// Zero value indicates that the task has not been processed yet.
+	//
+	// Note: For a task in active state, StartedAt is not known; see WorkerInfo.Started instead.
+	StartedAt time.Time
+
+	// Duration is how long the last processing attempt of the task took.
+	// It is only meaningful if StartedAt is not zero.
+	Duration time.Duration
+
+	// WaitTime is how long the task waited in the pending state before its last processing attempt started.
+	// Negative value indicates that the wait time is unknown.
+	WaitTime time.Duration
+
+	// RateLimitKey is the key of the rate limit that applies to the task, empty if none.
+	RateLimitKey string
+
+	// Flow is the name of the flow that enqueued the task, empty if none (see Flow).
+	Flow string
+
+	// FlowRunID is the ID of the flow run the task belongs to, empty if none (see Inspector.GetFlowRun).
+	FlowRunID string
+
+	// ParentID is the ID of the task whose completion enqueued this task in its flow run, empty if none.
+	ParentID string
+}
+
+// If t is non-zero, returns time converted from t as unix time in milliseconds.
+// If t is zero, returns zero value of time.Time.
+func fromUnixMilliOrZero(t int64) time.Time {
+	if t == 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(t)
 }
 
 // If t is non-zero, returns time converted from t as unix time in seconds.
@@ -182,6 +225,16 @@ func newTaskInfo(msg *base.TaskMessage, state base.TaskState, nextProcessAt time
 		LastFailedAt:  fromUnixTimeOrZero(msg.LastFailedAt),
 		CompletedAt:   fromUnixTimeOrZero(msg.CompletedAt),
 		Result:        result,
+		EnqueuedAt:    fromUnixMilliOrZero(msg.EnqueuedAt),
+		StartedAt:     fromUnixMilliOrZero(msg.StartedAt),
+		RateLimitKey:  msg.RateLimitKey,
+		Flow:          msg.Flow,
+		FlowRunID:     msg.FlowRun,
+		ParentID:      msg.ParentID,
+	}
+	if msg.StartedAt != 0 {
+		info.Duration = time.Duration(msg.DurationMs) * time.Millisecond
+		info.WaitTime = time.Duration(msg.WaitMs) * time.Millisecond
 	}
 
 	switch state {
@@ -569,6 +622,9 @@ type ResultWriter struct {
 	qname  string // queue name the task belongs to
 	broker base.Broker
 	ctx    context.Context // context associated with the task
+
+	mu   sync.Mutex
+	last []byte // last result written, passed to the next tasks of a flow
 }
 
 // Write writes the given data as a result of the task the ResultWriter is associated with.
@@ -578,7 +634,23 @@ func (w *ResultWriter) Write(data []byte) (n int, err error) {
 		return 0, fmt.Errorf("failed to write task result: %w", w.ctx.Err())
 	default:
 	}
-	return w.broker.WriteResult(w.qname, w.id, data)
+	n, err = w.broker.WriteResult(w.qname, w.id, data)
+	if err == nil {
+		w.mu.Lock()
+		w.last = append([]byte(nil), data...)
+		w.mu.Unlock()
+	}
+	return n, err
+}
+
+// lastResult returns the last result written.
+func (w *ResultWriter) lastResult() []byte {
+	if w == nil {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.last
 }
 
 // TaskID returns the ID of the task the ResultWriter is associated with.

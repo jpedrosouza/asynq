@@ -11,7 +11,7 @@ option go_package = "github.com/jpedrosouza/asynq/internal/proto";
 
 // TaskMessage is the internal representation of a task with additional
 // metadata fields.
-// Next ID: 16
+// Next ID: 25
 message TaskMessage {
 	// Type indicates the kind of the task to be performed.
   string type = 1;
@@ -68,6 +68,44 @@ message TaskMessage {
   // the number of seconds elapsed since January 1, 1970 UTC.
   // This field is populated if result_ttl > 0 upon completion.
   int64 completed_at = 13;
+
+  // Time when the task was first enqueued, in Unix time with millisecond
+  // precision. It is kept as is through retries.
+  // Use zero to indicate no value (e.g. the task was enqueued by an older
+  // version of the library).
+  int64 enqueued_at = 16;
+
+  // Time when the last processing attempt started, in Unix time with
+  // millisecond precision. Use zero to indicate no value.
+  int64 started_at = 17;
+
+  // Duration of the last processing attempt in milliseconds.
+  int64 duration_ms = 18;
+
+  // Time the task waited in the pending list before its last processing
+  // attempt started, in milliseconds. Negative value means unknown.
+  int64 wait_ms = 19;
+
+  // RateLimitKey names the rate limit shared by the tasks with the same key.
+  // Empty string indicates that no key level rate limit applies to the task.
+  string rate_limit_key = 20;
+
+  // Time of the rate limit slot reserved for the task, in Unix time with
+  // millisecond precision. A task that was deferred because its rate limit key
+  // had no capacity left keeps the slot it reserved, so it does not consume
+  // the rate limit again when it comes back. Use zero to indicate no slot.
+  int64 rate_limit_slot = 21;
+
+  // Flow is the name of the flow that enqueued the task, empty if none.
+  string flow = 22;
+
+  // FlowRun is the ID of the flow run the task belongs to (the ID of the
+  // first task of the run), empty if the task is not part of a run.
+  string flow_run = 23;
+
+  // ParentId is the ID of the task whose completion enqueued this task in
+  // the flow run, empty if none.
+  string parent_id = 24;
 };
 
 // ServerInfo holds information about a running server.
