@@ -125,7 +125,7 @@ func TestClientEnqueueWithProcessAtOption(t *testing.T) {
 			continue
 		}
 		cmpOptions := []cmp.Option{
-			cmpopts.IgnoreFields(TaskInfo{}, "ID"),
+			cmpopts.IgnoreFields(TaskInfo{}, "ID", "EnqueuedAt"),
 			cmpopts.EquateApproxTime(500 * time.Millisecond),
 		}
 		if diff := cmp.Diff(tc.wantInfo, gotInfo, cmpOptions...); diff != "" {
@@ -462,7 +462,7 @@ func testClientEnqueue(t *testing.T, client *Client, r redis.UniversalClient) {
 			continue
 		}
 		cmpOptions := []cmp.Option{
-			cmpopts.IgnoreFields(TaskInfo{}, "ID"),
+			cmpopts.IgnoreFields(TaskInfo{}, "ID", "EnqueuedAt"),
 			cmpopts.EquateApproxTime(500 * time.Millisecond),
 		}
 		if diff := cmp.Diff(tc.wantInfo, gotInfo, cmpOptions...); diff != "" {
@@ -616,7 +616,7 @@ func TestClientEnqueueWithGroupOption(t *testing.T) {
 			continue
 		}
 		cmpOptions := []cmp.Option{
-			cmpopts.IgnoreFields(TaskInfo{}, "ID"),
+			cmpopts.IgnoreFields(TaskInfo{}, "ID", "EnqueuedAt"),
 			cmpopts.EquateApproxTime(500 * time.Millisecond),
 		}
 		if diff := cmp.Diff(tc.wantInfo, gotInfo, cmpOptions...); diff != "" {
@@ -711,6 +711,7 @@ func TestClientEnqueueWithTaskIDOption(t *testing.T) {
 
 		cmpOptions := []cmp.Option{
 			cmpopts.EquateApproxTime(500 * time.Millisecond),
+			cmpopts.IgnoreFields(TaskInfo{}, "EnqueuedAt"),
 		}
 		if diff := cmp.Diff(tc.wantInfo, gotInfo, cmpOptions...); diff != "" {
 			t.Errorf("%s;\nEnqueue(task) returned %v, want %v; (-want,+got)\n%s",
@@ -719,7 +720,7 @@ func TestClientEnqueueWithTaskIDOption(t *testing.T) {
 
 		for qname, want := range tc.wantPending {
 			got := h.GetPendingMessages(t, r, qname)
-			if diff := cmp.Diff(want, got); diff != "" {
+			if diff := cmp.Diff(want, got, h.IgnoreTimingOpt); diff != "" {
 				t.Errorf("%s;\nmismatch found in %q; (-want,+got)\n%s", tc.desc, base.PendingKey(qname), diff)
 			}
 		}
@@ -843,7 +844,7 @@ func TestClientEnqueueWithProcessInOption(t *testing.T) {
 			continue
 		}
 		cmpOptions := []cmp.Option{
-			cmpopts.IgnoreFields(TaskInfo{}, "ID"),
+			cmpopts.IgnoreFields(TaskInfo{}, "ID", "EnqueuedAt"),
 			cmpopts.EquateApproxTime(500 * time.Millisecond),
 		}
 		if diff := cmp.Diff(tc.wantInfo, gotInfo, cmpOptions...); diff != "" {
@@ -1040,7 +1041,7 @@ func TestClientWithDefaultOptions(t *testing.T) {
 			t.Fatal(err)
 		}
 		cmpOptions := []cmp.Option{
-			cmpopts.IgnoreFields(TaskInfo{}, "ID"),
+			cmpopts.IgnoreFields(TaskInfo{}, "ID", "EnqueuedAt"),
 			cmpopts.EquateApproxTime(500 * time.Millisecond),
 		}
 		if diff := cmp.Diff(tc.wantInfo, gotInfo, cmpOptions...); diff != "" {
@@ -1419,7 +1420,7 @@ func TestClientEnqueueWithHeaders(t *testing.T) {
 		}
 
 		cmpOptions := []cmp.Option{
-			cmpopts.IgnoreFields(TaskInfo{}, "ID"),
+			cmpopts.IgnoreFields(TaskInfo{}, "ID", "EnqueuedAt"),
 			cmpopts.EquateApproxTime(500 * time.Millisecond),
 		}
 		if diff := cmp.Diff(tc.wantInfo, gotInfo, cmpOptions...); diff != "" {
@@ -1505,7 +1506,7 @@ func TestClientEnqueueWithHeadersScheduled(t *testing.T) {
 		}
 
 		cmpOptions := []cmp.Option{
-			cmpopts.IgnoreFields(TaskInfo{}, "ID"),
+			cmpopts.IgnoreFields(TaskInfo{}, "ID", "EnqueuedAt"),
 			cmpopts.EquateApproxTime(500 * time.Millisecond),
 		}
 		if diff := cmp.Diff(tc.wantInfo, gotInfo, cmpOptions...); diff != "" {
@@ -1711,7 +1712,7 @@ func TestClientEnqueueWithHeadersAndGroup(t *testing.T) {
 		}
 
 		cmpOptions := []cmp.Option{
-			cmpopts.IgnoreFields(TaskInfo{}, "ID"),
+			cmpopts.IgnoreFields(TaskInfo{}, "ID", "EnqueuedAt"),
 			cmpopts.EquateApproxTime(500 * time.Millisecond),
 		}
 		if diff := cmp.Diff(tc.wantInfo, gotInfo, cmpOptions...); diff != "" {

@@ -411,7 +411,7 @@ func TestProcessorRetry(t *testing.T) {
 					Score:   runTime.Add(tc.delay).Unix(),
 				})
 		}
-		if diff := cmp.Diff(wantRetry, gotRetry, h.SortZSetEntryOpt, cmpOpt); diff != "" {
+		if diff := cmp.Diff(wantRetry, gotRetry, h.SortZSetEntryOpt, cmpOpt, h.IgnoreTimingOpt); diff != "" {
 			t.Errorf("%s: mismatch found in %q after running processor; (-want, +got)\n%s", tc.desc, base.RetryKey(base.DefaultQueueName), diff)
 		}
 
@@ -424,7 +424,7 @@ func TestProcessorRetry(t *testing.T) {
 					Score:   runTime.Unix(),
 				})
 		}
-		if diff := cmp.Diff(wantArchived, gotArchived, h.SortZSetEntryOpt, cmpOpt); diff != "" {
+		if diff := cmp.Diff(wantArchived, gotArchived, h.SortZSetEntryOpt, cmpOpt, h.IgnoreTimingOpt); diff != "" {
 			t.Errorf("%s: mismatch found in %q after running processor; (-want, +got)\n%s", tc.desc, base.ArchivedKey(base.DefaultQueueName), diff)
 		}
 
@@ -506,7 +506,7 @@ func TestProcessorMarkAsComplete(t *testing.T) {
 
 		for qname, want := range tc.wantCompleted(runTime) {
 			gotCompleted := h.GetCompletedEntries(t, r, qname)
-			if diff := cmp.Diff(want, gotCompleted, cmpopts.EquateEmpty()); diff != "" {
+			if diff := cmp.Diff(want, gotCompleted, cmpopts.EquateEmpty(), h.IgnoreTimingOpt); diff != "" {
 				t.Errorf("diff found in %q completed set; want=%v, got=%v\n%s", qname, want, gotCompleted, diff)
 			}
 		}

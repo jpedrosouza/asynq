@@ -3678,7 +3678,7 @@ func TestInspectorGroups(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Groups returned error: %v", err)
 			}
-			if diff := cmp.Diff(tc.want, got, sortGroupInfosOpt); diff != "" {
+			if diff := cmp.Diff(tc.want, got, sortGroupInfosOpt, cmpopts.IgnoreFields(GroupInfo{}, "OldestTaskAt", "NewestTaskAt")); diff != "" {
 				t.Errorf("Groups = %v, want %v; (-want,+got)\n%s", got, tc.want, diff)
 			}
 		})

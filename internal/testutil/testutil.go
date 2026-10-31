@@ -108,7 +108,11 @@ var SortRedisZSetEntryOpt = cmp.Transformer("SortZSetEntries", func(in []redis.Z
 })
 
 // IgnoreIDOpt is an cmp.Option to ignore ID field in task messages when comparing.
-var IgnoreIDOpt = cmpopts.IgnoreFields(base.TaskMessage{}, "ID")
+// It also ignores the timing fields set from the wall clock (EnqueuedAt, StartedAt, DurationMs and WaitMs).
+var IgnoreIDOpt = cmpopts.IgnoreFields(base.TaskMessage{}, "ID", "EnqueuedAt", "StartedAt", "DurationMs", "WaitMs")
+
+// IgnoreTimingOpt is an cmp.Option to ignore the timing fields of task messages set from the wall clock.
+var IgnoreTimingOpt = cmpopts.IgnoreFields(base.TaskMessage{}, "EnqueuedAt", "StartedAt", "DurationMs", "WaitMs")
 
 // NewTaskMessage returns a new instance of TaskMessage given a task type and payload.
 func NewTaskMessage(taskType string, payload []byte) *base.TaskMessage {

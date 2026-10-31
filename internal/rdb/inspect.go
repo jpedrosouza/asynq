@@ -6,6 +6,7 @@ package rdb
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -568,14 +569,28 @@ type GroupStat struct {
 
 	// Size of the group.
 	Size int
+
+	// OldestAt is the time the oldest task of the group was added to it, in Unix time.
+	OldestAt int64
+
+	// NewestAt is the time the newest task of the group was added to it, in Unix time.
+	NewestAt int64
+
+	// Policy is the aggregation policy last used for the group by a server, nil if unknown.
+	Policy *base.GroupPolicy
+
+	// FlushRequested reports whether the group will be aggregated at the next check regardless of its policy.
+	FlushRequested bool
 }
 
 // KEYS[1] -> asynq:{<qname>}:groups
+// KEYS[2] -> asynq:{<qname>}:group_policies
+// KEYS[3] -> asynq:{<qname>}:flush_groups
 // -------
 // ARGV[1] -> group key prefix
 //
 // Output:
-// list of group name and size (e.g. group1 size1 group2 size2 ...)
+// list of group name, size, oldest score, newest score, policy and flush flag for each group
 //
 // Time Complexity:
 // O(N) where N being the number of groups in the given queue.
@@ -583,31 +598,52 @@ var groupStatsCmd = redis.NewScript(`
 local res = {}
 local group_names = redis.call("SMEMBERS", KEYS[1])
 for _, gname in ipairs(group_names) do
-	local size = redis.call("ZCARD", ARGV[1] .. gname)
+	local key = ARGV[1] .. gname
+	local size = redis.call("ZCARD", key)
+	local oldest = 0
+	local newest = 0
+	if size > 0 then
+		oldest = redis.call("ZRANGE", key, 0, 0, "WITHSCORES")[2]
+		newest = redis.call("ZREVRANGE", key, 0, 0, "WITHSCORES")[2]
+	end
 	table.insert(res, gname)
 	table.insert(res, size)
+	table.insert(res, tostring(oldest))
+	table.insert(res, tostring(newest))
+	table.insert(res, redis.call("HGET", KEYS[2], gname) or "")
+	table.insert(res, redis.call("SISMEMBER", KEYS[3], gname))
 end
 return res
 `)
 
 func (r *RDB) GroupStats(qname string) ([]*GroupStat, error) {
 	var op errors.Op = "RDB.GroupStats"
-	keys := []string{base.AllGroups(qname)}
+	keys := []string{base.AllGroups(qname), base.GroupPoliciesKey(qname), base.FlushGroupsKey(qname)}
 	argv := []interface{}{base.GroupKeyPrefix(qname)}
 	res, err := groupStatsCmd.Run(context.Background(), r.client, keys, argv...).Result()
 	if err != nil {
 		return nil, errors.E(op, errors.Unknown, err)
 	}
 	data, err := cast.ToSliceE(res)
-	if err != nil {
+	if err != nil || len(data)%6 != 0 {
 		return nil, errors.E(op, errors.Internal, "cast error: unexpected return value from Lua script")
 	}
 	var stats []*GroupStat
-	for i := 0; i < len(data); i += 2 {
-		stats = append(stats, &GroupStat{
-			Group: data[i].(string),
-			Size:  int(data[i+1].(int64)),
-		})
+	for i := 0; i < len(data); i += 6 {
+		st := &GroupStat{
+			Group:          cast.ToString(data[i]),
+			Size:           cast.ToInt(data[i+1]),
+			OldestAt:       int64(cast.ToFloat64(data[i+2])),
+			NewestAt:       int64(cast.ToFloat64(data[i+3])),
+			FlushRequested: cast.ToInt(data[i+5]) == 1,
+		}
+		if s := cast.ToString(data[i+4]); s != "" {
+			var p base.GroupPolicy
+			if err := json.Unmarshal([]byte(s), &p); err == nil {
+				st.Policy = &p
+			}
+		}
+		stats = append(stats, st)
 	}
 	return stats, nil
 }
